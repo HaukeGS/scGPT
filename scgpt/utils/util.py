@@ -100,7 +100,10 @@ def get_free_gpu():
 
 
 def get_git_commit():
-    return subprocess.check_output(["git", "rev-parse", "HEAD"]).decode("utf-8").strip()
+    try:
+        return subprocess.check_output(["git", "rev-parse", "HEAD"]).decode("utf-8").strip()
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return None
 
 
 def histogram(

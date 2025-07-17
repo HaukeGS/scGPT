@@ -41,7 +41,7 @@ python pretrain.py \
     --no-cce \
     --fp16
 """
-print("print works")
+print("\n### Trying to import scGPT and other libraries...\n")
 
 # %%
 import os
@@ -74,7 +74,7 @@ from scgpt.scbank import DataBank
 from scgpt.utils import MainProcessOnly
 from scgpt import logger
 
-print(f"Imports successful!")
+print(f"\n### Imports successful!\n")
 
 
 # torch.autograd.set_detect_anomaly(True)
@@ -373,7 +373,7 @@ if args.training_tasks in ["gen", "both"]:
     args.mask_ratio = [0.25, 0.50, 0.75]
 
 # %% settings
-print(args)
+print(f"Arguments:\n {json.dumps(vars(args), indent=2)}\n")
 
 special_tokens = [args.pad_token, "<cls>", "<eoc>"]
 USE_CLS = not args.no_cls
@@ -410,9 +410,11 @@ if args.local_rank in [0, -1]:
     with open(save_dir / "args.json", "w") as f:
         json.dump(vars(args), f, indent=2)
     # copy all uncommitted changes to the save dir
-    os.system(
-        f"git diff > {str(save_dir / 'git_diff_')}{scg.utils.get_git_commit()}.diff"
-    )
+    git_commit = scg.utils.get_git_commit()
+    if git_commit:
+        os.system(
+            f"git diff > {str(save_dir / 'git_diff_')}{git_commit}.diff"
+        )
 if IS_DATA_PARALLEL:
     torch.distributed.barrier()
 
