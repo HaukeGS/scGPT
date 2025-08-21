@@ -204,6 +204,13 @@ parser.add_argument(
     "utility. Will be -1 if not running in distributed model.",
 )
 parser.add_argument(
+    "--local_rank",
+    type=int,
+    default=-1,
+    help="The local rank of the process for using the torch.distributed.launch "
+    "utility. Will be -1 if not running in distributed model.",
+)
+parser.add_argument(
     "--batch-size",
     type=int,
     default=32,
@@ -389,7 +396,7 @@ if IS_DATA_PARALLEL:
 
     torch.distributed.init_process_group(
         backend="nccl",
-        rank=args.local_rank,
+        rank=int(args.local_rank),
         timeout=timedelta(hours=10),
     )
     # specify device 0 since the CUDA_VISIBLE_DEVICES is set to one GPU
@@ -405,7 +412,12 @@ else:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 save_dir = Path(args.save_dir)
-if args.local_rank in [0, -1]:
+print(f"-----------------------------")
+print(f"Local rank: {args.local_rank}")
+print(f"args.local_rank in [0, -1]: {args.local_rank in [0, -1]}")
+print(f"args.local_rank.type: {type(args.local_rank)}")
+print(f"-----------------------------")
+if int(args.local_rank) in [0, -1]:
     print(f"\n### Save arguments and code changes for reproducibility...\n")
     save_dir.mkdir(parents=True, exist_ok=True)
     with open(save_dir / "args.json", "w") as f:
