@@ -406,22 +406,25 @@ else:
 
 save_dir = Path(args.save_dir)
 if args.local_rank in [0, -1]:
+    print(f"\n### Save arguments and code changes for reproducibility...\n")
     save_dir.mkdir(parents=True, exist_ok=True)
     with open(save_dir / "args.json", "w") as f:
         json.dump(vars(args), f, indent=2)
+    ### Loggs errors, potentially useful but not needed at the moment
     # copy all uncommitted changes to the save dir
-    git_commit = scg.utils.get_git_commit()
-    if git_commit:
-        os.system(
-            f"git diff > {str(save_dir / 'git_diff_')}{git_commit}.diff"
-        )
+    # git_commit = scg.utils.get_git_commit()
+    # print(f"+++ git commit: {git_commit}")
+    # if git_commit:
+    #     os.system(
+    #         f"git diff > {str(save_dir / 'git_diff_')}{git_commit}.diff"
+    #     )
 if IS_DATA_PARALLEL:
     torch.distributed.barrier()
 
 scg.utils.add_file_handler(logger, save_dir / "run.log")
 # log running date and current git commit
 logger.info(f"Running on {time.strftime('%Y-%m-%d %H:%M:%S')}")
-logger.info(f"Current git commit: {scg.utils.get_git_commit()}")
+# logger.info(f"Current git commit: {scg.utils.get_git_commit()}")
 
 writer = SummaryWriter(log_dir=save_dir / "tensorboard")
 if IS_DATA_PARALLEL:
@@ -447,8 +450,17 @@ def _map_append_cls(dataset: Dataset) -> Dataset:
     return dataset
 
 
+print()
+print(f"### data_source: {args.data_source}")
+print(f"### args.data_source.endswith('human'): {args.data_source.endswith('human')}")
+print(f"### args.data_source.is_dir(): {Path(args.data_source).is_dir()}")
+print(f"### args.data_source.endswith('.scb'): {args.data_source.endswith('.scb')}")
+print()
+
+
 # Load data
-if args.data_source.endswith("human"):
+### TODO: Find out what this is for
+if args.data_source.endswith("human"): 
     TISSUE_LIST = [
         "heart",
         "blood",
@@ -482,7 +494,7 @@ if args.data_source.endswith("human"):
     for s in special_tokens:
         if s not in vocab:
             vocab.append_token(s)
-
+### Preprocesses the data, not needed anymore, because Alex preprocessed all of it already
 elif Path(args.data_source).is_dir() and args.data_source.endswith(".scb"):
     # the large-scale data structure
     db = DataBank.from_path(args.data_source)
@@ -507,15 +519,19 @@ elif Path(args.data_source).is_dir() and args.data_source.endswith(".scb"):
             cache_dir=args.data_source,
         )
         logger.info(f"Loaded {len(raw_dataset)} examples from {cls_prefix_datatable}")
+### Loads the data from .parquet files
 elif Path(args.data_source).is_dir():
+    print(f"\n### Loading data from {args.data_source}...\n")
     # collection of parquet files
     parquet_files = [str(f) for f in Path(args.data_source).glob("*.parquet")]
+    print(f"\n### Found {len(parquet_files)} parquet files in {args.data_source}")
     cache_dir = Path(args.data_source).parent / "cache"
     vocab = GeneVocab.from_file(Path(args.vocab_path))
     for s in special_tokens:
         if s not in vocab:
             vocab.append_token(s)
     if USE_CCE or USE_CLS or MVC:
+        print(f"\n### Loading data with <cls> prefix from {args.data_source}...\n")
         # load or make the dataset w/ <cls> appended at the beginning
         cls_prefix_datatable = Path(args.data_source) / "cls_prefix_data.parquet"
         if not cls_prefix_datatable.exists():
@@ -538,38 +554,39 @@ elif Path(args.data_source).is_dir():
             cache_dir=str(cache_dir),
         )
         logger.info(f"Loaded {len(raw_dataset)} examples from {cls_prefix_datatable}")
-elif Path(args.data_source).is_file():
-    adata = sc.read(args.data_source, cache=True)
-    # Specific the required column names, when loading the data the first time.
-    # Store the column names for later use.
-    (
-        celltype_col,
-        str_celltype_col,
-        gene_col,
-        batch_key,
-    ) = scg.utils.find_required_colums(
-        adata,
-        id=args.data_source,
-        configs_dir=Path(args.data_source).parent,
-    )
-    if celltype_col is None:
-        celltype_col = "int" + str_celltype_col
-        adata.obs[celltype_col] = scg.utils.category_str2int(
-            adata.obs[str_celltype_col]
-        )
-elif args.data_source == "test":  # Using test data
-    raw_dataset = Dataset.from_dict(
-        {
-            "id": [1] * 300,
-            "genes": [[1, 2, 3]] * 300,
-            "expressions": [[1.0, 2.0, 3.0]] * 300,
-        }
-    )
-    vocab = GeneVocab.from_dict({"zero": 0, "a": 1, "b": 2, "c": 3})
-    for s in special_tokens:
-        if s not in vocab:
-            vocab.append_token(s)
+# elif Path(args.data_source).is_file():
+#     adata = sc.read(args.data_source, cache=True)
+#     # Specific the required column names, when loading the data the first time.
+#     # Store the column names for later use.
+#     (
+#         celltype_col,
+#         str_celltype_col,
+#         gene_col,
+#         batch_key,
+#     ) = scg.utils.find_required_colums(
+#         adata,
+#         id=args.data_source,
+#         configs_dir=Path(args.data_source).parent,
+#     )
+#     if celltype_col is None:
+#         celltype_col = "int" + str_celltype_col
+#         adata.obs[celltype_col] = scg.utils.category_str2int(
+#             adata.obs[str_celltype_col]
+#         )
+# elif args.data_source == "test":  # Using test data
+#     raw_dataset = Dataset.from_dict(
+#         {
+#             "id": [1] * 300,
+#             "genes": [[1, 2, 3]] * 300,
+#             "expressions": [[1.0, 2.0, 3.0]] * 300,
+#         }
+#     )
+#     vocab = GeneVocab.from_dict({"zero": 0, "a": 1, "b": 2, "c": 3})
+#     for s in special_tokens:
+#         if s not in vocab:
+#             vocab.append_token(s)
 
+### TODO: Find out how to load a model
 if args.load_model is not None:
     model_dir = Path(args.load_model)
     model_config_file = model_dir / "args.json"
@@ -617,6 +634,10 @@ if args.local_rank in [0, -1]:
 if IS_DATA_PARALLEL:
     torch.distributed.barrier()  # wait for saving all the files
 
+print(f"\n### Loaded vocabulary with {len(vocab)} tokens.\n")
+print(f"### Start processing data with {len(raw_dataset)} samples...\n")
+
+
 # %% [markdown]
 # # Data processing
 # convert format to return torch.tensor
@@ -659,9 +680,9 @@ train_loader = DataLoader(
     sampler=train_sampler,
     collate_fn=collator,
     drop_last=False,
-    num_workers=min(len(os.sched_getaffinity(0)), args.batch_size),
+    num_workers=0, ### min(len(os.sched_getaffinity(0)), args.eval_batch_size), TODO: check whether this is needed and try to avoid deadlocks
     pin_memory=True,
-    prefetch_factor=4,
+    # prefetch_factor=4, ### Does not work without multiprocessing
 )
 valid_sampler = (
     DistributedSampler(valid_dataset, shuffle=False)
@@ -674,7 +695,7 @@ valid_loader = DataLoader(
     sampler=valid_sampler,
     collate_fn=collator,
     drop_last=False,
-    num_workers=min(len(os.sched_getaffinity(0)), args.eval_batch_size),
+    num_workers=0, ### min(len(os.sched_getaffinity(0)), args.eval_batch_size), TODO: check whether this is needed and try to avoid deadlocks
     pin_memory=True,
 )
 
@@ -717,6 +738,7 @@ Some key points:
 
 # %%
 if USE_CLS:
+    print(f"\n### raw_dataset column names: {raw_dataset.column_names}\n")
     celltypes_labels = raw_dataset["celltypes"]
     num_types = len(set(celltypes_labels))
     celltypes_labels = np.array(celltypes_labels)
@@ -725,7 +747,7 @@ if USE_CLS:
 # max_num_of_non_zero_genes = db.num_genes
 
 # if args.local_rank in [0, -1]:
-#     scg.utils.histogram(
+#     scg.utils.histogram(<
 #         torch.cat(train_dataset[:10000]["expressions"]).numpy(),
 #         torch.cat(valid_dataset[:10000]["expressions"]).numpy(),
 #         title="Histogram of clipped values",
@@ -744,7 +766,7 @@ model = TransformerModel(
     d_hid=args.d_hid,
     nlayers=args.nlayers,
     nlayers_cls=args.n_layers_cls,
-    n_cls=num_types if USE_CLS else 1,
+    n_cls=1, # num_types if USE_CLS else 1,
     vocab=vocab,
     dropout=args.dropout,
     pad_token=args.pad_token,
@@ -758,6 +780,7 @@ model = TransformerModel(
     use_fast_transformer=args.fast_transformer,
     fast_transformer_backend="flash",
 )
+
 if args.load_model is not None:
     try:
         model.load_state_dict(torch.load(model_file))
@@ -784,6 +807,7 @@ criterion_cls = nn.CrossEntropyLoss()
 optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
 
 # setup scheduler
+### creates a cosine scheduler with linear warmup. num_training_steps is the total number of batches inlcuding warmup
 if args.warmup_ratio_or_step > 0:
     total_num_batches = len(train_loader) * args.epochs
     warmup_steps = (
@@ -802,7 +826,11 @@ else:
         optimizer, args.scheduler_interval, gamma=args.scheduler_factor
     )
 
+
 # amp fp16 training
+### AMP (Automatic Mixed Precision) is a PyTorch feature that allows for
+### training models with mixed precision (float16 and float32) to speed up training
+### as opposed to using only float32.
 scaler = torch.cuda.amp.GradScaler(enabled=args.fp16)
 
 
@@ -821,6 +849,7 @@ def train(model: nn.Module, train_loader: DataLoader, epoch: int) -> None:
         global_iter = epoch * num_batches + batch
 
         data_dict = {k: v.to(device) for k, v in data_dict.items()}
+        # print(f"\n+++ data_dict keys: {data_dict.keys()}")
         if USE_GENERATIVE_TRAINING:
             pcpt_gene = data_dict["pcpt_gene"]
             pcpt_expr = data_dict["pcpt_expr"]
@@ -973,14 +1002,19 @@ def train(model: nn.Module, train_loader: DataLoader, epoch: int) -> None:
             cur_error = total_error / log_interval
             # ppl = math.exp(cur_loss)
             logger.info(
-                f"| epoch {epoch:3d} | {batch:3d}/{num_batches:3d} batches | "
+                f"| epoch {epoch:1d} | {batch:4d}/{num_batches:3d} batches | "
                 f"lr {lr:05.4f} | ms/batch {ms_per_batch:5.2f} | "
                 f"loss {cur_loss:5.2f} | mse {cur_mse:5.2f} | mre {cur_error:5.2f} |"
-                + (f"cls {cur_cls:5.2f} | " if USE_CLS else "")
-                + (f"gen {cur_gen:5.2f} |" if "loss_gen" in locals() else "")
-                + (f"mvc {cur_mvc:5.2f} |" if MVC else "")
+                + (f"cls {cur_cls:05.2f} | " if USE_CLS else "")
+                + (f"gen {cur_gen:05.2f} |" if "loss_gen" in locals() else "")
+                + (f"mvc {cur_mvc:05.2f} |" if MVC else "")
             )
             writer.add_scalar("lr", lr, global_iter)
+            writer.flush()
+
+            if (batch > 1000):
+                print(f"Reached batch goal of 1000, stopping training.")
+                sys.exit("Stopping training after 1000 batches.")
 
             total_loss = 0
             total_mse = 0

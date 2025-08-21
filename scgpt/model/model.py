@@ -391,6 +391,8 @@ class TransformerModel(nn.Module):
         cell_emb = self._get_cell_emb_from_layer(transformer_output)
         output["cell_emb"] = cell_emb
 
+        # print(f"\n+++ cell_emb.shape: {cell_emb.shape}")
+
         if CLS:
             output["cls_output"] = self.cls_decoder(cell_emb)  # (batch, n_cls)
         if MVC:
@@ -531,6 +533,11 @@ class TransformerModel(nn.Module):
             output["gen_preds"] = full_preds[:, pcpt_genes.shape[1] :]
         if self.explicit_zero_prob:
             output["zero_probs"] = decoder_output["zero_probs"]
+
+        # print(f"\n+++ Output keys: {output.keys()}")
+        # print(f"+++ transformer_output shape: {transformer_output.shape}")
+        # print(f"+++ batch_emb shape: {batch_emb if self.use_batch_labels else None}")
+        # print(f"+++ CLS: {CLS}, MVC: {MVC}, ECS: {ECS}, do_sample: {do_sample}")
 
         output = self._extend_output(
             output,
