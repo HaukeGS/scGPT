@@ -2,7 +2,7 @@
 
 # See `man sbatch` or https://slurm.schedmd.com/sbatch.html for descriptions of sbatch options.
 #SBATCH --job-name=scGPT_dist_pretrain              # A nice readable name of your job, to see it in the queue
-#SBATCH --nodes=1                                      # Number of nodes to request
+#SBATCH --nodes=2                                      # Number of nodes to request
 #SBATCH --ntasks-per-node=2                             # total number of tasks per node
 #SBATCH --cpus-per-task=4                               # Number of CPUs to request
 #SBATCH --gres=gpu:2                                     # Number of GPUs to request
@@ -27,12 +27,16 @@ echo "SLURM_NTASKS=$SLURM_NTASKS"
 echo "WORLD_SIZE=$WORLD_SIZE"
 
 # scGPT parameters
-TISSUE="blood"
-DATA_SOURCE="/data/datasets/biology/scGPT-data/preprocessed/$TISSUE/all_counts"
+TISSUES=("blood" "brain")
+DATA_SOURCES=()
+
+for TISSUE in "${TISSUES[@]}"; do
+    DATA_SOURCES+=("/data/datasets/biology/scGPT-data/preprocessed/$TISSUE/all_counts")
+done
 
 # Your job script goes below this line
 srun python -u scGPT_distributed/pretrain_distributed.py \
-    --data-source $DATA_SOURCE \
+    --data-source "${DATA_SOURCES[@]}" \
     --epochs 1 \
     --training-tasks "both" \
     --save-dir ./save/pretrain-distributed-$(date +%Y-%m-%d_%H-%M-%S) \

@@ -9,7 +9,7 @@ def add_arguments(parser: argparse.ArgumentParser):
     parser.add_argument(
         "-d",
         "--data-source",
-        type=str,
+        nargs='+',
         required=True,
         help='The name of the data source (currently support "scvi" datasets), or the '
         "path to the data file.",

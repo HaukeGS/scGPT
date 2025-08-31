@@ -1,7 +1,7 @@
 
 
 ### Imports
-print("### Trying to import scGPT and other libraries...\n")
+print("### Trying to import scGPT and other libraries...")
 
 # systen relevant imports
 import os
@@ -40,7 +40,62 @@ from scgpt import logger
 
 import argparser
 
-print(f"### Imports successful!\n")
+print(f"### Imports successful!")
+
+
+# %% Data preprocessing
+
+def get_vocabulary(vocab_path: Path) -> GeneVocab:
+    vocab = GeneVocab.from_file(vocab_path)
+    for s in SPECIAL_TOKENS:
+        if s not in vocab:
+            vocab.append_token(s)
+    return vocab
+
+# def get_dataset(data_source_path: Path, vocab: GeneVocab) -> Dataset:
+#     if (data_source_path.is_dir()):
+
+    # print(f"\n### Loading data from {data_source_path}...\n")
+    # # collection of parquet files
+    # parquet_files = [str(f) for f in Path(args.data_source).glob("*.parquet")]
+    # print(f"\n### Found {len(parquet_files)} parquet files in {args.data_source}")
+    # cache_dir = Path(args.data_source).parent / "cache"
+    # vocab = GeneVocab.from_file(Path(args.vocab_path))
+    # for s in special_tokens:
+    #     if s not in vocab:
+    #         vocab.append_token(s)
+    # if USE_CCE or USE_CLS or MVC:
+    #     print(f"\n### Loading data with <cls> prefix from {args.data_source}...\n")
+    #     # load or make the dataset w/ <cls> appended at the beginning
+    #     cls_prefix_datatable = Path(args.data_source) / "cls_prefix_data.parquet"
+    #     if not cls_prefix_datatable.exists():
+    #         if args.local_rank in [0, -1]:
+    #             logger.info(f"Rank {args.local_rank}: Preparing dataset")
+    #             raw_dataset = load_dataset(
+    #                 "parquet",
+    #                 data_files=parquet_files,
+    #                 split="train",
+    #                 cache_dir=str(cache_dir),
+    #             )
+    #             raw_dataset = _map_append_cls(raw_dataset)
+    #             raw_dataset.to_parquet(str(cls_prefix_datatable))
+    #         if IS_DATA_PARALLEL:
+    #             torch.distributed.barrier()  # wait for the mapping to finish
+    #     raw_dataset = load_dataset(
+    #         "parquet",
+    #         data_files=str(cls_prefix_datatable),
+    #         split="train",
+    #         cache_dir=str(cache_dir),
+    #     )
+    #     logger.info(f"Loaded {len(raw_dataset)} examples from {cls_prefix_datatable}")
+
+
+# %% Model initialization
+
+
+
+
+# %% Training and evaluation
 
 
 
@@ -92,6 +147,7 @@ def initialize_utility_variables(args: argparse.Namespace):
             json.dump(vars(args), f, indent=2)
 
     scg.utils.set_seed(42)
+    scg.utils.add_file_handler(logger, SAVE_DIR / "run.log")
 
 
 def get_arguments():
@@ -120,6 +176,8 @@ def main():
     setup_distributeddataparallel()
     try:
         printgpu(f"Setup complete")
+        vocab = get_vocabulary(Path(args.vocab_path))
+        print(f"Data Sources: {args.data_source}")
         dist.barrier()
         time.sleep(2)
     finally:
@@ -130,16 +188,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
-# %% Data preprocessing
-
-
-
-
-# %% Model initialization
-
-
-
-
-# %% Training and evaluation
