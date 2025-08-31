@@ -43,13 +43,23 @@ import argparser
 print(f"### Imports successful!\n")
 
 
-### SLURM setup and main
 
-
+# %% SLURM setup and main
 def setup_distributeddataparallel():
-    # initialize the process group
-    dist.init_process_group("nccl", rank=GLOBAL_RANK, world_size=WORLD_SIZE)
-    if GLOBAL_RANK == 0: print(f"Group initialized? {dist.is_initialized()}", flush=True)
+    """
+    Setup the DistributedDataParallel (DDP) environment.
+    """
+    try:
+        dist.init_process_group("nccl", rank=GLOBAL_RANK, world_size=WORLD_SIZE)
+        if GLOBAL_RANK == 0: print(f"Group initialized? {dist.is_initialized()}", flush=True)
+        
+        # Test communication with a barrier
+        dist.barrier()
+        printgpu(f"Successfully synchronized with all processes")
+        
+    except Exception as e:
+        printgpu(f"Failed in setup: {e}")
+        raise
 
 
 def initialize_slurm_variables():
@@ -65,6 +75,25 @@ def initialize_slurm_variables():
     torch.cuda.set_device(LOCAL_RANK)
 
 
+def initialize_utility_variables(args: argparse.Namespace):
+    """
+    Initialize utility variables from the arguments globally.
+    """
+    global SAVE_DIR, USE_GENERATIVE_TRAINING, SPECIAL_TOKENS, USE_CLS, USE_CCE, MVC
+    SAVE_DIR = Path(args.save_dir)
+    os.makedirs(SAVE_DIR, exist_ok=True)
+    USE_GENERATIVE_TRAINING = True if args.training_tasks in ["gen", "both"] else False
+    SPECIAL_TOKENS = [args.pad_token, "<cls>", "<eoc>"]
+    USE_CLS = not args.no_cls
+    USE_CCE = not args.no_cce
+    MVC = True
+    if GLOBAL_RANK == 0:
+        with open(SAVE_DIR / "args.json", "w") as f:
+            json.dump(vars(args), f, indent=2)
+
+    scg.utils.set_seed(42)
+
+
 def get_arguments():
     """
     Get command line arguments.  
@@ -74,20 +103,43 @@ def get_arguments():
     return parser.parse_args()
 
 
+def printgpu(string: str, flush: bool = True):
+    """
+    Print a message with infos about which GPU is being used.
+    """
+    output = f"[GPU:{GLOBAL_RANK}][{NODE_ID}:{LOCAL_RANK}] {string}"
+    print(output, flush=flush)
+
+
 def main():
     initialize_slurm_variables()
-    print(f"NODEID: {NODE_ID}, GLOBAL_RANK: {GLOBAL_RANK}, WORLD_SIZE: {WORLD_SIZE}, SLURM_GPUS_ON_NODE: {GPUS_PER_NODE}, LOCAL_RANK: {LOCAL_RANK}", flush=True)
-    assert GPUS_PER_NODE == torch.cuda.device_count()
-
-
     args = get_arguments()
-    print(f"Arguments:\n {json.dumps(vars(args), indent=2)}\n")
+    initialize_utility_variables(args)
+    print(f"NODEID: {NODE_ID}, GLOBAL_RANK: {GLOBAL_RANK}, WORLD_SIZE: {WORLD_SIZE}, SLURM_GPUS_ON_NODE: {GPUS_PER_NODE}, LOCAL_RANK: {LOCAL_RANK}, DEVICE_COUNT: {torch.cuda.device_count()}", flush=True)
+
     setup_distributeddataparallel()
     try:
-        print(f"Setup complete")
+        printgpu(f"Setup complete")
+        dist.barrier()
+        time.sleep(2)
     finally:
-        dist.destroy_process_group()
+        if dist.is_initialized():
+            dist.barrier()
+            dist.destroy_process_group()
 
 
 if __name__ == "__main__":
     main()
+
+
+# %% Data preprocessing
+
+
+
+
+# %% Model initialization
+
+
+
+
+# %% Training and evaluation
