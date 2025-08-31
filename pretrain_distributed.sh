@@ -1,0 +1,43 @@
+#!/bin/bash
+
+# See `man sbatch` or https://slurm.schedmd.com/sbatch.html for descriptions of sbatch options.
+#SBATCH --job-name=scGPT_dist_pretrain              # A nice readable name of your job, to see it in the queue
+#SBATCH --nodes=1                                      # Number of nodes to request
+#SBATCH --ntasks-per-node=2                             # total number of tasks per node
+#SBATCH --cpus-per-task=8                               # Number of CPUs to request
+#SBATCH --gres=gpu:2                                     # Number of GPUs to request
+#SBATCH --partition=ampere
+#SBATCH --output=/home/hauke.schuele/scGPT_distributed/logs/%x-%j.out  # File to which STDOUT will be written
+#SBATCH --error=/home/hauke.schuele/scGPT_distributed/logs/%x-%j.err   # File to which STDERR will be written
+#SBATCH --time=00:05:00              # Time limit (hh:mm:ss)
+
+module load mamba
+micromamba activate scgpt_manual
+
+
+# SLURM parameters
+master_address=$(scontrol show hostnames $SLURM_JOB_NODELIST | head -n 1)
+export MASTER_ADDR=$master_address
+export MASTER_PORT=12355
+export WORLD_SIZE=$(($SLURM_NNODES * $SLURM_NTASKS_PER_NODE))
+echo "MASTER_ADDR=$MASTER_ADDR"
+echo "MASTER_PORT=$MASTER_PORT"
+echo "SLURM_NNODES=$SLURM_NNODES"
+echo "SLURM_NTASKS=$SLURM_NTASKS"
+echo "WORLD_SIZE=$WORLD_SIZE"
+
+# scGPT parameters
+TISSUE="blood"
+DATA_SOURCE="/data/datasets/biology/scGPT-data/preprocessed/$TISSUE/all_counts"
+
+# Your job script goes below this line
+srun python -u scGPT_distributed/pretrain_distributed.py \
+    --data-source $DATA_SOURCE \
+    --epochs 1 \
+    --training-tasks "both" \
+    --save-dir ./save/pretrain-distributed-$(date +%Y-%m-%d_%H-%M-%S) \
+    --vocab-path "/data/datasets/biology/scGPT-data/preprocessed/default_census_vocab.json" \
+    --trunc-by-sample \
+    --no-cls \
+    --no-cce \
+    --fp16
