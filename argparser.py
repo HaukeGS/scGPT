@@ -1,4 +1,6 @@
 import argparse
+from pathlib import Path
+from typing import List
 
 def get_parser():
     parser = argparse.ArgumentParser()
@@ -6,13 +8,19 @@ def get_parser():
     return parser
 
 def add_arguments(parser: argparse.ArgumentParser):    
-    parser.add_argument(
+    data_group = parser.add_mutually_exclusive_group(required=True)
+    data_group.add_argument(
         "-d",
         "--data-source",
-        nargs='+',
-        required=True,
+        type=str,
         help='The name of the data source (currently support "scvi" datasets), or the '
         "path to the data file.",
+    )
+    data_group.add_argument(
+        "-ds",
+        "--data-sources",
+        nargs='+',
+        help='An array of paths to datasources. Expects to find a preprocessed cls_prefix_data.parquet file in each directory',
     )
     parser.add_argument(
         "-s",
@@ -113,6 +121,7 @@ def add_arguments(parser: argparse.ArgumentParser):
     parser.add_argument(
         "--vocab-path",
         type=str,
+        required=True,
         help="Path to the vocabulary file.",
     )
     # settings for training
@@ -253,3 +262,23 @@ def add_arguments(parser: argparse.ArgumentParser):
         help="The interval for saving the model. Default is 1000.",
     )
 
+def get_datapaths(args: argparse.Namespace) -> List[Path]:
+    """
+    Get the data sources from the command line arguments.
+    We can specify either one or multiple data_sources, so this function returns a uniform data structure.
+    """
+    data_paths = []
+    # Check which data source argument was provided
+    if args.data_source is not None:
+        # Single data source provided
+        data_paths = [Path(args.data_source)]  # Convert to list for uniform processing
+
+    elif args.data_sources is not None:
+        # Multiple data sources provided
+        data_paths = [Path(ds) for ds in args.data_sources]  # Convert to list of Paths
+        
+    else:
+        # This shouldn't happen due to required=True, but good practice
+        raise ValueError("No data source provided")
+
+    return data_paths

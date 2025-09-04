@@ -9,7 +9,7 @@
 #SBATCH --partition=ampere
 #SBATCH --output=/home/hauke.schuele/scGPT_distributed/logs/%x-%j.out  # File to which STDOUT will be written
 #SBATCH --error=/home/hauke.schuele/scGPT_distributed/logs/%x-%j.err   # File to which STDERR will be written
-#SBATCH --time=00:50:00              # Time limit (hh:mm:ss)
+#SBATCH --time=02:00:00              # Time limit (hh:mm:ss)
 
 module load mamba
 micromamba activate scgpt_manual
@@ -27,7 +27,8 @@ echo "SLURM_NTASKS=$SLURM_NTASKS"
 echo "WORLD_SIZE=$WORLD_SIZE"
 
 # scGPT parameters
-TISSUES=("blood" "brain")
+# TISSUES=("blood" "brain")  # try to use smaller datasets for now
+TISSUES=("kidney" "lung")
 DATA_SOURCES=()
 
 for TISSUE in "${TISSUES[@]}"; do
@@ -36,7 +37,7 @@ done
 
 # Your job script goes below this line
 srun python -u scGPT_distributed/pretrain_distributed.py \
-    --data-source "${DATA_SOURCES[@]}" \
+    --data-sources "${DATA_SOURCES[@]}" \
     --epochs 1 \
     --training-tasks "both" \
     --save-dir ./save/pretrain-distributed-$(date +%Y-%m-%d_%H-%M-%S) \
