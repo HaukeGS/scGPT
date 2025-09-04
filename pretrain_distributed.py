@@ -60,9 +60,22 @@ def printgpu(string: str, flush: bool = True):
     print(output, flush=flush)
 
 
+def dump_args(args: argparse.Namespace) -> None:
+    """
+    Dump the arguments to a json file in the save directory.
+    """
+    if is_master_gpu():
+        with open(SAVE_DIR / "args.json", "w") as f:
+            json.dump(vars(args), f, indent=2)
+
+
 # %% Data preprocessing
 
 def get_vocabulary(vocab_path: Path) -> GeneVocab:
+    """
+    Load the vocabulary from the specified path.
+    If the special tokens are not in the vocabulary, add them.
+    """
     vocab = GeneVocab.from_file(vocab_path)
     for s in SPECIAL_TOKENS:
         if s not in vocab:
@@ -71,6 +84,9 @@ def get_vocabulary(vocab_path: Path) -> GeneVocab:
 
 
 def dump_vocab(vocab: GeneVocab) -> None:
+    """
+    Dump the vocabulary to a json file in the save directory.
+    """
     if is_master_gpu():
         with open(SAVE_DIR / "vocab.json", "w") as f:
             json.dump(
@@ -223,7 +239,7 @@ def get_dataloaders(
 
 
 
-# %% SLURM setup and main
+# %% setup and initialization
 
 
 def setup_distributeddataparallel():
@@ -232,7 +248,6 @@ def setup_distributeddataparallel():
     """
     try:
         dist.init_process_group("nccl", rank=GLOBAL_RANK, world_size=WORLD_SIZE)
-        if GLOBAL_RANK == 0: print(f"Group initialized? {dist.is_initialized()}", flush=True)
         
         # Test communication with a barrier
         dist.barrier()
@@ -252,7 +267,7 @@ def initialize_slurm_variables():
     WORLD_SIZE    = int(os.environ["WORLD_SIZE"])
     GPUS_PER_NODE = int(os.environ["SLURM_GPUS_ON_NODE"])
     GLOBAL_RANK   = int(os.environ["SLURM_PROCID"])
-    CPUS_PER_TASK = int(os.environ.get("SLURM_CPUS_PER_TASK", "1"))
+    CPUS_PER_TASK = int(os.environ["SLURM_CPUS_PER_TASK"])
     LOCAL_RANK = GLOBAL_RANK - GPUS_PER_NODE * (GLOBAL_RANK // GPUS_PER_NODE)
     printgpu(f"CPUS_PER_TASK: {CPUS_PER_TASK}")
     torch.cuda.set_device(LOCAL_RANK)
@@ -273,9 +288,6 @@ def initialize_utility_variables(args: argparse.Namespace):
     # MVC = True
 
     SEED = 42
-    if is_master_gpu():
-        with open(SAVE_DIR / "args.json", "w") as f:
-            json.dump(vars(args), f, indent=2)
 
     scg.utils.set_seed(SEED)
     scg.utils.add_file_handler(logger, SAVE_DIR / "run.log")
@@ -308,16 +320,20 @@ def get_arguments():
     return parser.parse_args()
 
 
+# %% main
+
+
 def main():
     initialize_slurm_variables()
     args = get_arguments()
     args = initialize_additional_arguments(args)
     initialize_utility_variables(args)
+    dump_args(args)
     print(f"NODEID: {NODE_ID}, GLOBAL_RANK: {GLOBAL_RANK}, WORLD_SIZE: {WORLD_SIZE}, SLURM_GPUS_ON_NODE: {GPUS_PER_NODE}, LOCAL_RANK: {LOCAL_RANK}, DEVICE_COUNT: {torch.cuda.device_count()}", flush=True)
 
     setup_distributeddataparallel()
+    printmaster(f"Setup complete. Group initialized? {dist.is_initialized()}", flush=True)
     try:
-        printgpu(f"Setup complete")
         vocab = get_vocabulary(Path(args.vocab_path))
         dump_vocab(vocab)
         train_loader, validation_loader = get_dataloaders(
@@ -336,6 +352,7 @@ def main():
         )
         dist.barrier()
         time.sleep(2)
+        model = get_model()
     finally:
         if dist.is_initialized():
             dist.barrier()
