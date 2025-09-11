@@ -178,7 +178,7 @@ def add_arguments(parser: argparse.ArgumentParser):
         "This will only be used when warmup-ratio is 0.",
     )
     parser.add_argument(
-        "--warmup-ratio-or-step",
+        "--warmup-ratio-or-steps",
         type=float,
         default=0.1,
         help="The ratio of warmup steps out of the total training steps. Default is 0.1. "

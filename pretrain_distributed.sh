@@ -26,9 +26,11 @@ echo "SLURM_NNODES=$SLURM_NNODES"
 echo "SLURM_NTASKS=$SLURM_NTASKS"
 echo "WORLD_SIZE=$WORLD_SIZE"
 
+# dont(!) export TORCH_DISTRIBUTED_DEBUG=DETAIL
+
 # scGPT parameters
-# TISSUES=("blood" "brain")  # try to use smaller datasets for now
-TISSUES=("kidney" "lung")
+TISSUES=("blood")  # try to use smaller datasets for now
+# TISSUES=("kidney" "lung")
 DATA_SOURCES=()
 
 for TISSUE in "${TISSUES[@]}"; do
@@ -40,7 +42,7 @@ srun python -u scGPT_distributed/pretrain_distributed.py \
     --data-sources "${DATA_SOURCES[@]}" \
     --epochs 1 \
     --training-tasks "both" \
-    --save-dir ./save/pretrain-distributed-$(date +%Y-%m-%d_%H-%M-%S) \
+    --save-dir ./save/pretrain-distributed-[$SLURM_JOB_ID]-$(date +%Y-%m-%d_%H-%M-%S) \
     --vocab-path "/data/datasets/biology/scGPT-data/preprocessed/default_census_vocab.json" \
     --trunc-by-sample \
     --no-cls \
