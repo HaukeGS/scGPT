@@ -45,13 +45,10 @@ def add_arguments(parser: argparse.ArgumentParser):
         "Default is None, which will determine the n_hvg automatically.",
     )
     parser.add_argument(
-        "--valid-size-or-ratio",
-        type=float,
+        "--valid-ratio",
+        type=float_in_range_0_1,
         default=0.1,
-        help="The ratio or size of the validation set size if split the dataset. "
-        "If value is between 0 and 1, will be parsed as the ratio. If value is "
-        "greater than 1 and be an integer, will be parsed as the size. If value "
-        "is 0, will not split the dataset.",
+        help="The ratio of the validation set out of the total data. Expects a float between 0 and 1. Default is 0.1.",
     )
 
     parser.add_argument(
@@ -59,6 +56,13 @@ def add_arguments(parser: argparse.ArgumentParser):
         type=int,
         default=1,
         help="The number of gradient accumulation steps. Default is 1.",
+    )
+    parser.add_argument(
+        "--subset-ratio",
+        type=float_in_range_0_1,
+        default=1.0,
+        help="The ratio of data to use for training. Expects a float between 0 and 1. "
+        "Useful for debugging with a smaller dataset. Default is 1.0 (use all data).",
     )
 
     # settings for tokenizer
@@ -91,7 +95,7 @@ def add_arguments(parser: argparse.ArgumentParser):
     parser.add_argument(
         "--max-seq-len",
         type=int,
-        default=1536,
+        default=1000,
         help="The maximum length of the sequence. Default is 1000. The actual used "
         "max length would be the minimum of this value and the length of the longest "
         "sequence in the data.",
@@ -282,3 +286,16 @@ def get_datapaths(args: argparse.Namespace) -> List[Path]:
         raise ValueError("No data source provided")
 
     return data_paths
+
+
+def float_in_range_0_1(value: str) -> float:
+    """Custom argparse type to ensure a float is in the range (0.0, 1.0)."""
+    try:
+        fvalue = float(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"{value} is not a valid float")
+
+    if fvalue <= 0.0 or fvalue >= 1.0:
+        raise argparse.ArgumentTypeError(f"{value} is not in the range (0.0, 1.0)")
+
+    return fvalue

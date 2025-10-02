@@ -47,14 +47,21 @@ def is_master_gpu():
     return GLOBAL_RANK == 0
 
 
+def printtime(string: str, flush: bool = True):
+    current_runtime = time.time() - runtime_startTime
+    current_runtime = str(timedelta(seconds=int(current_runtime)))
+    if is_master_gpu():
+        print(f"[{current_runtime}]|{string}", flush=flush)
+
+
 def printmaster(string: str, flush: bool = True):
     if is_master_gpu():
-        print(f"[MASTER] {string}", flush=flush)
+        printtime(f"[MASTER] {string}", flush=flush)
 
 
 def printlogging(string: str, level: str, flush: bool = True):
     if is_master_gpu():
-        print(f"[{level.upper()}] {string}", flush=flush)
+        printtime(f"[{level.upper()}] {string}", flush=flush)
 
 
 def printgpu(string: str, flush: bool = True):
@@ -62,7 +69,7 @@ def printgpu(string: str, flush: bool = True):
     Print a message with infos about which GPU is being used.
     """
     output = f"[GPU:{GLOBAL_RANK}][{NODE_ID}:{LOCAL_RANK}] {string}"
-    print(output, flush=flush)
+    printtime(output, flush=flush)
 
 
 def dump_args(args: argparse.Namespace) -> None:
@@ -110,7 +117,7 @@ def dump_debug(output: str) -> None:
             f.write(output + "\n")
 
 
-def create_dataset(data_paths: List[Path]) -> Dataset:
+def create_dataset(data_paths: List[Path], subset_ratio: float = 1.0) -> Dataset:
     """
     Load the dataset from the specified data source.
     data_source can contain multiple directories. See argparser.py for more details
@@ -132,13 +139,26 @@ def create_dataset(data_paths: List[Path]) -> Dataset:
             split="train",  # specify train to load all the data into a dataset directly and not a dataset dict
             cache_dir=str(path.parent / "cache"),
         )
+        if subset_ratio < 1.0:
+            subset_size = int(len(raw_dataset) * subset_ratio)
+            raw_dataset = raw_dataset.shuffle(seed=SEED).select(range(subset_size))
         datasets.append(raw_dataset)
-        printmaster(f"Loaded {len(raw_dataset)} examples from {cls_prefix_datatable}")
+        printmaster(f"Loaded {len(raw_dataset)} examples from {cls_prefix_datatable}" + 
+                    f" because of subset_ratio={subset_ratio}" if subset_ratio < 1.0 else "")
         example_count += len(raw_dataset)
     printmaster(f"Total examples across all datasets: {example_count}")
+    if subset_ratio < 1.0:
+        printmaster(f"Note: subset_ratio={subset_ratio} applied to each dataset")
     merged_dataset = concatenate_datasets(datasets)
     merged_dataset = merged_dataset.with_format("torch")
+
     printmaster(f"dataset columns: {merged_dataset.column_names}")
+    # printmaster("\n=== Dataset Example ===")
+    # example = merged_dataset[0]  # Get first example
+    # for key, value in example.items():
+    #     printmaster(f"{key}: {value}")
+    # printmaster("========================\n")
+    
     return merged_dataset
 
 
@@ -190,7 +210,7 @@ def create_dataloaders(train_dataset: Dataset, validation_dataset: Dataset, batc
         pin_memory=True,
         drop_last=True,
         collate_fn=collator,
-        # prefetch_factor=CPUS_PER_TASK
+        prefetch_factor=2
     )
     validation_loader = DataLoader(
         validation_dataset,
@@ -200,7 +220,7 @@ def create_dataloaders(train_dataset: Dataset, validation_dataset: Dataset, batc
         pin_memory=True,
         drop_last=False,
         collate_fn=collator,
-        # prefetch_factor=CPUS_PER_TASK
+        prefetch_factor=2
     )
     return train_loader, validation_loader
 
@@ -218,11 +238,12 @@ def get_dataloaders(
         trunc_by_sample: bool,
         training_tasks: str,
         batch_size: int,
+        subset_ratio: float = 1.0,
     ) -> Tuple[DataLoader, DataLoader]:
     """
     Get the dataloaders for training and validation datasets.
     """
-    dataset = create_dataset(data_paths)
+    dataset = create_dataset(data_paths, subset_ratio=subset_ratio)
     printmaster(f"Final dataset length: {len(dataset)}")
     collator = create_collator(
         vocab=vocab,
@@ -242,6 +263,11 @@ def get_dataloaders(
     printmaster(f"Train loader length for one GPU: {len(train_loader)}")
     printmaster(f"Train loader length for all GPUs: {len(train_loader) * WORLD_SIZE}")
     printmaster(f"Validation loader length for all GPUs: {len(validation_loader)}")
+    example = next(iter(train_loader))
+    # printmaster("=== Train Loader Example ===")
+    # for key, value in example.items():
+    #     printmaster(f"{key}: {value.shape}")
+    # printmaster("===========================")
     return train_loader, validation_loader
 
 
@@ -351,6 +377,7 @@ def pretrain(
         mask_value: float,
         fp16_enabled: bool,
         scaler: torch.cuda.amp.GradScaler,
+        grad_accu_steps: int = 1,
     ) -> None:
     """
     Train the model for the specified number of epochs.
@@ -420,6 +447,8 @@ def pretrain(
 
                 total_loss = loss_mse + loss_mvc + loss_gen
 
+            if grad_accu_steps > 1:
+                total_loss = total_loss / grad_accu_steps
             optimizer.zero_grad()
             scaler.scale(total_loss).backward()
             scaler.unscale_(optimizer)
@@ -429,8 +458,11 @@ def pretrain(
             )  # gradient clipping
             scaler.step(optimizer)
             scaler.update()
-            scheduler.step()
-            
+            if grad_accu_steps > 1:
+                if (i + 1) % grad_accu_steps == 0 or (i + 1) == len(train_loader):
+                    scheduler.step()
+            else:
+                scheduler.step()
 
             if is_master_gpu() and global_iter % log_interval == 0 and global_iter > 0:
                 writer.add_scalar("loss/mse", loss_mse, global_iter)
@@ -449,7 +481,7 @@ def pretrain(
                     level="training"
                 )
 
-            if global_iter % save_interval == 0 and global_iter > 0:
+            if (global_iter % save_interval == 0 and global_iter > 0) or (i + 1) == len(train_loader):
                 val_mse, val_mre = evaluate(
                     model=model,
                     validation_loader=validation_loader,
@@ -462,6 +494,7 @@ def pretrain(
                 )
                 writer.add_scalar("validation/mse", val_mse, global_iter)
                 writer.add_scalar("validation/mre", val_mre, global_iter)
+                saved = False
                 if val_mse < best_val_mse:
                     best_val_mse = val_mse
                     if is_master_gpu():
@@ -469,10 +502,11 @@ def pretrain(
                             model.state_dict(),
                             SAVE_DIR / "best_model_mse.pt",
                         )
+                        saved = True
                 printlogging(
-                    f"Epoch {epoch+1:2d} | Iter {i+1:5d}/{len(train_loader)} | "
-                    f"Loss: {val_mse.item():12.4f} | "
-                    f"Saved: {val_mse < best_val_mse}",
+                    f"Epoch {epoch+1:2d} | Iter {i:5d}/{len(train_loader)} | "
+                    f"Loss: {val_mse:12.4f} | "
+                    f"Saved: {saved}",
                     level="validation"
                 )
 
@@ -618,6 +652,7 @@ def initialize_additional_arguments(args: argparse.Namespace) -> argparse.Namesp
         args.n_input_bins = args.n_bins
 
     if args.training_tasks in ["gen", "both"]:
+        printmaster(f"args.mask_ratio: {args.mask_ratio} (can be float or list of floats)")
         args.mask_ratio = [0.25, 0.50, 0.75]
     return args
 
@@ -635,6 +670,8 @@ def get_arguments():
 
 
 def main():
+    global runtime_startTime
+    runtime_startTime = time.time()
     initialize_slurm_variables()
     args = get_arguments()
     args = initialize_additional_arguments(args)
@@ -651,7 +688,7 @@ def main():
         dump_vocab(vocab)
         train_loader, validation_loader = get_dataloaders(
             data_paths=argparser.get_datapaths(args), 
-            validation_ratio=args.valid_size_or_ratio, 
+            validation_ratio=args.valid_ratio, 
             vocab=vocab,
             max_seq_len=args.max_seq_len,
             pad_token=args.pad_token,
@@ -662,6 +699,7 @@ def main():
             trunc_by_sample=args.trunc_by_sample,
             training_tasks=args.training_tasks,
             batch_size=args.batch_size,
+            subset_ratio=args.subset_ratio,
         )
         dist.barrier()
         time.sleep(2)
@@ -709,6 +747,7 @@ def main():
             mask_value=args.mask_value,
             fp16_enabled=args.fp16,
             scaler=torch.cuda.amp.GradScaler(enabled=args.fp16),
+            grad_accu_steps=args.grad_accu_steps,
         )
     finally:
         if dist.is_initialized():
