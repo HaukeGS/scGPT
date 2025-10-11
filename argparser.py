@@ -22,6 +22,12 @@ def add_arguments(parser: argparse.ArgumentParser):
         nargs='+',
         help='An array of paths to datasources. Expects to find a preprocessed cls_prefix_data.parquet file in each directory',
     )
+    data_group.add_argument(
+        "--tissues",
+        nargs="+",
+        help="An array of tissue names to load from the standard preprocessed data directory structure."
+        "Will look for data in /home/user/cellxgene_data_sharded/<tissue>/shard_*.parquet",
+    )
     parser.add_argument(
         "-s",
         "--save-dir",
@@ -50,19 +56,17 @@ def add_arguments(parser: argparse.ArgumentParser):
         default=0.1,
         help="The ratio of the validation set out of the total data. Expects a float between 0 and 1. Default is 0.1.",
     )
-
-    parser.add_argument(
-        "--grad-accu-steps",
-        type=int,
-        default=1,
-        help="The number of gradient accumulation steps. Default is 1.",
-    )
     parser.add_argument(
         "--subset-ratio",
         type=float_in_range_0_1,
         default=1.0,
         help="The ratio of data to use for training. Expects a float between 0 and 1. "
         "Useful for debugging with a smaller dataset. Default is 1.0 (use all data).",
+    )
+    parser.add_argument(
+        "--streaming",
+        action="store_true",
+        help="Whether to enable streaming data loading. Default is False.",
     )
 
     # settings for tokenizer
@@ -190,6 +194,12 @@ def add_arguments(parser: argparse.ArgumentParser):
         "the value is above 1, will use it as the number of warmup steps.",
     )
     parser.add_argument(
+        "--grad-accu-steps",
+        type=int,
+        default=1,
+        help="The number of gradient accumulation steps. Default is 1.",
+    )
+    parser.add_argument(
         "--no-cls",
         action="store_true",
         help="Whether to deactivate the classification loss. Default is False.",
@@ -280,7 +290,15 @@ def get_datapaths(args: argparse.Namespace) -> List[Path]:
     elif args.data_sources is not None:
         # Multiple data sources provided
         data_paths = [Path(ds) for ds in args.data_sources]  # Convert to list of Paths
-        
+
+    elif args.tissues is not None:
+        # Multiple tissues provided, construct paths based on a standard directory structure
+        base_dir = Path.home() / "cellxgene_data_sharded"
+        for tissue in args.tissues:
+            tissue_path = base_dir / tissue
+            if not tissue_path.exists() or not tissue_path.is_dir():
+                raise ValueError(f"Tissue directory {tissue_path} does not exist or is not a directory.")
+            data_paths.append(tissue_path)
     else:
         # This shouldn't happen due to required=True, but good practice
         raise ValueError("No data source provided")
