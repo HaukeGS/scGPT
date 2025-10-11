@@ -3,6 +3,7 @@
 ### Imports
 
 # systen relevant imports
+import math
 import os
 import sys
 import argparse
@@ -81,6 +82,7 @@ def dump_args(args: argparse.Namespace) -> None:
     if is_master_gpu():
         with open(SAVE_DIR / "args.json", "w") as f:
             json.dump(vars(args), f, indent=2)
+    printmaster(json.dumps(vars(args), indent=2))
 
 
 # %% Data preprocessing
@@ -152,7 +154,7 @@ def get_total_batch_count_per_GPU(tissues: List[str], batch_size: int) -> int:
 
 
 def create_datasets_streaming(
-    data_paths: List[Path], 
+    data_paths: List[str], 
     validation_ratio: float,
     subset_ratio: float = 1.0,
 ) -> Tuple[Dataset, Dataset]:
@@ -167,6 +169,10 @@ def create_datasets_streaming(
             The paths to the data directories.
         validation_ratio: float: 
             The ratio of the dataset to use for validation.
+            Uses every 1/validation_ratio shard for validation.
+            Note: this is approximate, as the number of shards may not be divisible by validation_ratio.
+            Note: this might result in uneven shard distribution across GPUs if n_shards in a tissue is not divisible by 1/validation_ratio.
+            Best Example: For 25 shards, use validation_ratio=0.04 as 1/0.04=25 and thus every 25th shard will be used for validation.
         subset_ratio: float: (optional, default=1.0)
             The ratio of the dataset to use for training.
     returns:
@@ -176,7 +182,7 @@ def create_datasets_streaming(
             The interleaved validation dataset.
     """
     if not data_paths:
-        raise ValueError("No data paths provided")
+        raise ValueError("No data_paths provided")
     if subset_ratio < 1.0:
         raise ValueError("subset_ratio < 1.0 not yet supported for streaming datasets")
         # TODO: implement subset_ratio for streaming datasets
@@ -184,38 +190,49 @@ def create_datasets_streaming(
     train_datasets = []
     validation_datasets = []
 
-    shards = []
     for path in data_paths:
-        files = path.glob("shard_*.parquet")
-        files = list(files)
+        files = list(path.glob("shard_*.parquet"))
+        if not files:
+            raise FileNotFoundError(f"No shards found for path {path}")
         random.shuffle(files)
-        shards.extend([str(file) for i, file in enumerate(files) if (i % WORLD_SIZE) == GLOBAL_RANK])
-                
-        if not shards:
-            raise FileNotFoundError(f"No shards found for path {data_paths} on rank {GLOBAL_RANK}")
+        validation_threshold = math.ceil(len(files) * validation_ratio) if validation_ratio > 0 else 0
+        training_files = files[validation_threshold:]
+        validation_files = files[:validation_threshold] if validation_ratio > 0 else []
+        training_shards = [str(file) for i, file in enumerate(training_files) if (i % WORLD_SIZE) == GLOBAL_RANK]
+        validation_shards = [str(file) for file in validation_files]
+        printgpu(f"Found {len(files)} shards in {path} with {len(training_shards)} training shards and {len(validation_files)} validation shards assigned to this GPU (rank {GLOBAL_RANK})")
+        printgpu(f"validation shards: {validation_shards}")
 
-        dataset = load_dataset(
+        if not training_shards:
+            raise FileNotFoundError(f"No shards found for path {path} on rank {GLOBAL_RANK}")
+
+        train_dataset = load_dataset(
             "parquet",
-            data_files=shards,
+            data_files=training_shards,
             split="train",  # specify train to load all the data into a dataset directly and not a dataset dict
             cache_dir=str(path / "cache"),
             streaming=True,  # to avoid loading all data into memory at once
         )
 
-        # def validation_split(example, path, validation_ratio):
-        #     if 'id' not in example:
-        #         raise ValueError("Dataset must contain 'id' field for deterministic splitting in streaming mode")
-        #     key = f"{path}:{example['id']}"
-        #     h = int(hashlib.md5(key.encode('utf-8')).hexdigest(), 16)
-        #     return (h % 100) < (validation_ratio * 100)
+        if len(validation_files) > 0:
+            validation_dataset = load_dataset(
+                "parquet",
+                data_files=validation_shards,
+                split="train",  # specify train to load all the data into a dataset directly and not a dataset dict
+                cache_dir=str(path / "cache"),
+                streaming=True,  # to avoid loading all data into memory at once
+            )
+        else:
+            validation_dataset = None
+            printmaster(f"No validation shards found for path {path} because validation_ratio <= 0")
 
-        # train_dataset = dataset.filter(lambda x: not validation_split(x, str(path), validation_ratio))
-        # validation_dataset = dataset.filter(lambda x: validation_split(x, str(path), validation_ratio))
+        # for the validation set we will reshard the data again into more shards to be able to take a subset of it while still keeping a 
 
-        train_dataset = dataset
         train_datasets.append(train_dataset)
-        # validation_datasets.append(validation_dataset)
+        if validation_dataset:
+            validation_datasets.append(validation_dataset)
         printmaster(f"tissue: {path} train_dataset.n_shards: {train_dataset.n_shards}")
+        printmaster(f"tissue: {path} validation_dataset.n_shards: {validation_dataset.n_shards if validation_dataset else 0}")
 
 
     # def interleave_until_all_exhausted(datasets):
@@ -238,16 +255,25 @@ def create_datasets_streaming(
     train_dataset = concatenate_datasets(train_datasets) if len(train_datasets) > 1 else train_datasets[0]
     # printmaster(f"Number of training datasets to interleave: {len(train_datasets)}")
     # train_dataset = interleave_datasets(train_datasets, seed=SEED, stopping_strategy="first_exhausted") if len(train_datasets) > 1 else train_datasets[0]
-    # validation_dataset = interleave_datasets(validation_datasets, seed=SEED, stopping_strategy="all_exhausted") if len(validation_datasets) > 1 else validation_datasets[0]
+    # TODO: Interleave datasets with probabilities
     train_dataset = train_dataset.with_format("torch")
     printmaster(f"total train_dataset.n_shards: {train_dataset.n_shards}")
-    # validation_dataset = validation_dataset.with_format("torch")
 
-    return train_dataset, None
+
+    if len(validation_datasets) > 0:
+        printmaster(f"Number of validation datasets to concatenate: {len(validation_datasets)}")
+        validation_dataset = concatenate_datasets(validation_datasets) if len(validation_datasets) > 1 else validation_datasets[0]
+        # validation_dataset = interleave_datasets(validation_datasets, seed=SEED, stopping_strategy="all_exhausted") if len(validation_datasets) > 1 else validation_datasets[0]
+        validation_dataset = validation_dataset.with_format("torch") if validation_dataset else None
+        printmaster(f"total validation_dataset.n_shards: {validation_dataset.n_shards}")
+    else:
+        validation_dataset = None
+        printmaster(f"No validation datasets found because validation_ratio <= 0")
+
     return train_dataset, validation_dataset
 
 
-def create_dataset(data_paths: List[Path], subset_ratio: float = 1.0) -> Dataset:
+def create_datasets(data_paths: List[Path], validation_ratio: float = 0.0, subset_ratio: float = 1.0) -> Tuple[Dataset, Dataset]:
     """
     Load the dataset from the specified data source.
     data_source can contain multiple directories. See argparser.py for more details
@@ -258,34 +284,31 @@ def create_dataset(data_paths: List[Path], subset_ratio: float = 1.0) -> Dataset
         raise ValueError("No data paths provided")
     datasets = []
     example_count = 0
-    for path in data_paths:
-        cls_prefix_datatable = path / "cls_prefix_data.parquet"
-        if not cls_prefix_datatable.exists():
-            raise FileNotFoundError(f"File not found: {cls_prefix_datatable}")
+    for file in data_paths:
+        if not file.exists():
+            raise FileNotFoundError(f"File not found: {file}")
 
         raw_dataset = load_dataset(
             "parquet",
-            data_files=str(cls_prefix_datatable),
+            data_files=str(file),
             split="train",  # specify train to load all the data into a dataset directly and not a dataset dict
-            cache_dir=str(path.parent / "cache"),
+            cache_dir=str(file.parent / "cache"),
         )
         if subset_ratio < 1.0:
             subset_size = int(len(raw_dataset) * subset_ratio)
             raw_dataset = raw_dataset.shuffle(seed=SEED).select(range(subset_size))
 
         datasets.append(raw_dataset)
-        printmaster(f"Loaded {len(raw_dataset)} examples from {cls_prefix_datatable}" + 
-                    f" because of subset_ratio={subset_ratio}" if subset_ratio < 1.0 else "")
+        printmaster(f"Loaded {len(raw_dataset)} examples from {file}" + 
+                    (f" because of subset_ratio={subset_ratio}" if subset_ratio < 1.0 else ""))
         example_count += len(raw_dataset)
     printmaster(f"Total examples across all datasets: {example_count}")
     if subset_ratio < 1.0:
         printmaster(f"Note: subset_ratio={subset_ratio} applied to each dataset")
     merged_dataset = concatenate_datasets(datasets)
     merged_dataset = merged_dataset.with_format("torch")
-
-    printmaster(f"dataset columns: {merged_dataset.column_names}")
-    
-    return merged_dataset
+    train_dataset, validation_dataset = merged_dataset.train_test_split(test_size=validation_ratio, shuffle=True, seed=SEED).values()
+    return train_dataset, validation_dataset
 
 
 def create_collator(
@@ -323,6 +346,8 @@ def create_dataloaders(train_dataset: Dataset, validation_dataset: Dataset, batc
     Uses DistributedSampler for the training loader and uses the full validation dataset for the validation loader.
     """
     if streaming:
+        printmaster(f"type of train_dataset: {type(train_dataset)}")
+        printmaster(f"type of validation_dataset: {type(validation_dataset)}")
         train_loader = DataLoader(
             train_dataset,
             batch_size=batch_size,
@@ -332,16 +357,18 @@ def create_dataloaders(train_dataset: Dataset, validation_dataset: Dataset, batc
             collate_fn=collator,
             prefetch_factor=2
         )
-        validation_loader = None
-        # validation_loader = DataLoader(
-        #     validation_dataset,
-        #     batch_size=batch_size,
-        #     num_workers=0,
-        #     pin_memory=True,
-        #     drop_last=False,
-        #     collate_fn=collator,
-        #     prefetch_factor=2
-        # )
+        if validation_dataset:
+            validation_loader = DataLoader(
+                validation_dataset,
+                batch_size=batch_size,
+                num_workers=min(CPUS_PER_TASK, len(TISSUES)),
+                pin_memory=True,
+                drop_last=False,
+                collate_fn=collator,
+                prefetch_factor=2
+            )
+        else:
+            validation_loader = None
     else: 
         if dist.is_initialized():
             train_sampler = DistributedSampler(train_dataset, num_replicas=WORLD_SIZE, rank=GLOBAL_RANK, shuffle=True)
@@ -392,13 +419,14 @@ def get_dataloaders(
     Get the dataloaders for training and validation datasets.
     """
     if not streaming:
-        dataset = create_dataset(data_paths, subset_ratio=subset_ratio)
-        printmaster(f"Final dataset length: {len(dataset)}")
-        train_dataset, validation_dataset = dataset.train_test_split(test_size=validation_ratio, shuffle=True, seed=SEED).values()
+        train_dataset, validation_dataset = create_datasets(data_paths, validation_ratio=validation_ratio, subset_ratio=subset_ratio)
+        printmaster(f"Final training dataset length: {len(train_dataset)}")
+        printmaster(f"Final validation dataset length: {len(validation_dataset)}")
     else:
         train_dataset, validation_dataset = create_datasets_streaming(data_paths, subset_ratio=subset_ratio, validation_ratio=validation_ratio)
         sample_count = get_total_sample_counts(TISSUES) if TISSUES is not None else None
-        printmaster("Initialized streaming datasets with total sample count: " + (f"{sample_count}" if sample_count is not None else "unknown"))
+        printmaster("Initialized streaming train datasets with approximate sample count: " + (f"{sample_count * (1-validation_ratio)}" if sample_count is not None else "unknown"))
+        printmaster("Initialized streaming validation datasets with approximate sample count: " + (f"{sample_count * validation_ratio}" if sample_count is not None else "unknown"))
     collator = create_collator(
         vocab=vocab,
         max_seq_len=max_seq_len,
@@ -980,7 +1008,9 @@ def get_arguments():
     Arguments are specified in the argparser.py file.
     """
     parser = argparser.get_parser()
-    return parser.parse_args()
+    args = parser.parse_args()
+    argparser.validate_args(args)
+    return args
 
 
 # %% main
@@ -994,10 +1024,8 @@ def main():
     args = initialize_additional_arguments(args)
     initialize_utility_variables(args)
     dump_args(args)
-    print(f"NODEID: {NODE_ID}, GLOBAL_RANK: {GLOBAL_RANK}, WORLD_SIZE: {WORLD_SIZE}, SLURM_GPUS_ON_NODE: {GPUS_PER_NODE}, LOCAL_RANK: {LOCAL_RANK}, DEVICE_COUNT: {torch.cuda.device_count()}", flush=True)
-
     setup_distributeddataparallel()
-    printmaster(f"Setup complete. Group initialized? {dist.is_initialized()}", flush=True)
+    printmaster(f"Setup complete. Group initialized? {dist.is_initialized()}")
     try:
         total_start_time = time.time()
         # Load data
@@ -1051,6 +1079,7 @@ def main():
         )
         dist.barrier()
         time.sleep(2)
+        # start training
         if args.streaming:
             pretrain_streaming(
                 model=ddp_model,

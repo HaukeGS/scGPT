@@ -1,4 +1,5 @@
 import argparse
+import warnings
 from pathlib import Path
 from typing import List
 
@@ -8,25 +9,29 @@ def get_parser():
     return parser
 
 def add_arguments(parser: argparse.ArgumentParser):    
-    data_group = parser.add_mutually_exclusive_group(required=True)
-    data_group.add_argument(
+    data_input = parser.add_mutually_exclusive_group(required=True)
+    data_input.add_argument(
         "-d",
         "--data-source",
         type=str,
-        help='The name of the data source (currently support "scvi" datasets), or the '
-        "path to the data file.",
+        help="The path to the preprocessed .parquet file.",
     )
-    data_group.add_argument(
+    data_input.add_argument(
         "-ds",
         "--data-sources",
         nargs='+',
-        help='An array of paths to datasources. Expects to find a preprocessed cls_prefix_data.parquet file in each directory',
+        help="An array of paths to multiple preprocessed .parquet files.",
     )
-    data_group.add_argument(
+    data_input.add_argument(
         "--tissues",
         nargs="+",
-        help="An array of tissue names to load from the standard preprocessed data directory structure."
-        "Will look for data in /home/user/cellxgene_data_sharded/<tissue>/shard_*.parquet",
+        help="An array of tissue names to load. The data will be loaded from the path specified in --data_tissue_path. " \
+        "Depending whether --streaming is set, the tissue data will be expected to be in a single .parquet file in the same directory or in multiple sharded .parquet files (shard_***.parquet) in a subdirectory with the corresponding tissue name.",
+    )
+    parser.add_argument(
+        "--data-tissue-path",
+        type=str,
+        help="The base path where the .parquet files for the tissues are stored. See --tissues for more details.",
     )
     parser.add_argument(
         "-s",
@@ -53,8 +58,8 @@ def add_arguments(parser: argparse.ArgumentParser):
     parser.add_argument(
         "--valid-ratio",
         type=float_in_range_0_1,
-        default=0.1,
-        help="The ratio of the validation set out of the total data. Expects a float between 0 and 1. Default is 0.1.",
+        default=0.0,
+        help="The ratio of the validation set out of the total data. Expects a float between 0 and 1. Default is 0.0.",
     )
     parser.add_argument(
         "--subset-ratio",
@@ -65,8 +70,10 @@ def add_arguments(parser: argparse.ArgumentParser):
     )
     parser.add_argument(
         "--streaming",
-        action="store_true",
-        help="Whether to enable streaming data loading. Default is False.",
+        type=str2bool,
+        default=False,
+        help="Whether to enable streaming data loading. Default is False."
+        "Expects a boolean flag like True/False or yes/no (case insensitive).",
     )
 
     # settings for tokenizer
@@ -276,6 +283,13 @@ def add_arguments(parser: argparse.ArgumentParser):
         help="The interval for saving the model. Default is 1000.",
     )
 
+def validate_args(args: argparse.Namespace):
+    if args.tissues is not None and args.data_tissue_path is None:
+        raise ValueError("If --tissues is provided, --data-tissue-path must also be provided.")
+    if args.tissues is None and args.data_tissue_path is not None:
+        warnings.warn("--data-tissue-path is provided but --tissues is not. --data-tissue-path will be ignored.", UserWarning)
+
+
 def get_datapaths(args: argparse.Namespace) -> List[Path]:
     """
     Get the data sources from the command line arguments.
@@ -292,16 +306,23 @@ def get_datapaths(args: argparse.Namespace) -> List[Path]:
         data_paths = [Path(ds) for ds in args.data_sources]  # Convert to list of Paths
 
     elif args.tissues is not None:
-        # Multiple tissues provided, construct paths based on a standard directory structure
-        base_dir = Path.home() / "cellxgene_data_sharded"
+        if args.data_tissue_path is None:
+            raise ValueError("If --tissues is provided, --data-tissue-path must also be provided.")
+        base_path = Path(args.data_tissue_path)
         for tissue in args.tissues:
-            tissue_path = base_dir / tissue
-            if not tissue_path.exists() or not tissue_path.is_dir():
-                raise ValueError(f"Tissue directory {tissue_path} does not exist or is not a directory.")
-            data_paths.append(tissue_path)
-    else:
-        # This shouldn't happen due to required=True, but good practice
-        raise ValueError("No data source provided")
+            if args.streaming:
+                # Expect multiple sharded parquet files in a subdirectory named after the tissue
+                tissue_path = base_path / tissue
+                if not tissue_path.is_dir():
+                    raise ValueError(f"Expected directory for tissue '{tissue}' at {tissue_path}, but it does not exist or is not a directory.")
+                # we need to return the list of directories here and load the actual .parquet files in the create_dataset() function, because else we can't properly distribute the shards evenly across multiple GPUs
+                data_paths.append(tissue_path)
+            else:
+                # Expect a single parquet file named after the tissue
+                tissue_file = base_path / f"{tissue}.parquet"
+                if not tissue_file.is_file():
+                    raise ValueError(f"Expected file for tissue '{tissue}' at {tissue_file}, but it does not exist.")
+                data_paths.append(tissue_file)
 
     return data_paths
 
@@ -313,7 +334,18 @@ def float_in_range_0_1(value: str) -> float:
     except ValueError:
         raise argparse.ArgumentTypeError(f"{value} is not a valid float")
 
-    if fvalue <= 0.0 or fvalue >= 1.0:
-        raise argparse.ArgumentTypeError(f"{value} is not in the range (0.0, 1.0)")
+    if fvalue < 0.0 or fvalue >= 1.0:
+        raise argparse.ArgumentTypeError(f"{value} is not in the range [0.0, 1.0)")
 
     return fvalue
+
+
+def str2bool(value: str) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value.lower() in ('yes', 'true', 't', 'y', '1'):
+        return True
+    elif value.lower() in ('no', 'false', 'f', 'n', '0'):
+        return False
+    else:
+        raise argparse.ArgumentTypeError('Boolean value expected.')
