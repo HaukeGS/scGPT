@@ -121,6 +121,18 @@ def dump_debug(output: str) -> None:
             f.write(output + "\n")
 
 
+def get_tissue_sample_count(tissue: str) -> int:
+    """
+    Get the number of samples in the specified tissue.
+    """
+    with open("total_dataset_sample_counts.json", "r") as f:
+        example_numbers = json.load(f)
+        if tissue not in example_numbers:
+            raise KeyError(f"Tissue '{tissue}' not found in total_dataset_sample_counts.json")
+        else:
+            return example_numbers[tissue]
+
+
 def get_total_sample_counts(tissues: List[str]) -> int:
     """
     Get the total number of samples in the dataset.
@@ -251,19 +263,25 @@ def create_datasets_streaming(
     # train_dataset = IterableDataset.from_generator(lambda: interleave_until_all_exhausted(train_datasets))
     # validation_dataset = IterableDataset.from_generator(lambda: interleave_until_all_exhausted(validation_datasets))
 
-    printmaster(f"Number of training datasets to concatenate: {len(train_datasets)}")
-    train_dataset = concatenate_datasets(train_datasets) if len(train_datasets) > 1 else train_datasets[0]
-    # printmaster(f"Number of training datasets to interleave: {len(train_datasets)}")
-    # train_dataset = interleave_datasets(train_datasets, seed=SEED, stopping_strategy="first_exhausted") if len(train_datasets) > 1 else train_datasets[0]
-    # TODO: Interleave datasets with probabilities
+    # printmaster(f"Number of training datasets to concatenate: {len(train_datasets)}")
+    # train_dataset = concatenate_datasets(train_datasets) if len(train_datasets) > 1 else train_datasets[0]
+    printmaster(f"Number of training datasets to interleave: {len(train_datasets)}")
+    # train_dataset = interleave_datasets(train_datasets, seed=SEED, stopping_strategy="all_exhausted_without_replacement") if len(train_datasets) > 1 else train_datasets[0]
+    sample_counts = [get_tissue_sample_count(tissue) for tissue in TISSUES]
+    probabilities = [sample_count / sum(sample_counts) for sample_count in sample_counts]
+    stopping_strategy = "first_exhausted"
+    # stopping_strategy = "all_exhausted"
+    # printmaster(f"Interleaving datasets with stopping strategy {stopping_strategy} with probabilities: {probabilities}, sum: {sum(probabilities)}")
+    printmaster(f"Interleaving datasets with stopping strategy {stopping_strategy}, without probabilities")
+    train_dataset = interleave_datasets(train_datasets, seed=SEED, stopping_strategy=stopping_strategy) if len(train_datasets) > 1 else train_datasets[0]
     train_dataset = train_dataset.with_format("torch")
     printmaster(f"total train_dataset.n_shards: {train_dataset.n_shards}")
 
 
     if len(validation_datasets) > 0:
         printmaster(f"Number of validation datasets to concatenate: {len(validation_datasets)}")
-        validation_dataset = concatenate_datasets(validation_datasets) if len(validation_datasets) > 1 else validation_datasets[0]
-        # validation_dataset = interleave_datasets(validation_datasets, seed=SEED, stopping_strategy="all_exhausted") if len(validation_datasets) > 1 else validation_datasets[0]
+        # validation_dataset = concatenate_datasets(validation_datasets) if len(validation_datasets) > 1 else validation_datasets[0]
+        validation_dataset = interleave_datasets(validation_datasets, seed=SEED, stopping_strategy=stopping_strategy) if len(validation_datasets) > 1 else validation_datasets[0]
         validation_dataset = validation_dataset.with_format("torch") if validation_dataset else None
         printmaster(f"total validation_dataset.n_shards: {validation_dataset.n_shards}")
     else:
@@ -346,8 +364,6 @@ def create_dataloaders(train_dataset: Dataset, validation_dataset: Dataset, batc
     Uses DistributedSampler for the training loader and uses the full validation dataset for the validation loader.
     """
     if streaming:
-        printmaster(f"type of train_dataset: {type(train_dataset)}")
-        printmaster(f"type of validation_dataset: {type(validation_dataset)}")
         train_loader = DataLoader(
             train_dataset,
             batch_size=batch_size,
@@ -698,6 +714,7 @@ def pretrain_streaming(
                     f"Saved: {saved}",
                     level="validation"
                 )
+            global_iter += 1
 
     writer.close()
     printmaster("Training complete.")
@@ -910,12 +927,13 @@ def evaluate(
 
             total_mse += loss.item() * batch_size
             total_mre += mre.item() * batch_size
+            total_count += batch_size
             
     if dist.is_initialized():
         dist.barrier()
         total_mse = torch.tensor(total_mse, device=device, dtype=torch.float)
         total_mre = torch.tensor(total_mre, device=device, dtype=torch.float)
-        total_count = torch.tensor(len(validation_loader.dataset), device=device, dtype=torch.float)
+        total_count = torch.tensor(total_count, device=device, dtype=torch.float)
         dist.all_reduce(total_mse, op=dist.ReduceOp.SUM)
         dist.all_reduce(total_mre, op=dist.ReduceOp.SUM)
         dist.all_reduce(total_count, op=dist.ReduceOp.SUM)
@@ -998,7 +1016,7 @@ def initialize_additional_arguments(args: argparse.Namespace) -> argparse.Namesp
 
     if args.training_tasks in ["gen", "both"]:
         printmaster(f"args.mask_ratio: {args.mask_ratio} (can be float or list of floats)")
-        args.mask_ratio = [0.25, 0.50, 0.75]
+        # args.mask_ratio = [0.25, 0.50, 0.75]
     return args
 
 

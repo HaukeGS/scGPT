@@ -2,7 +2,7 @@
 
 # See `man sbatch` or https://slurm.schedmd.com/sbatch.html for descriptions of sbatch options.
 #SBATCH --job-name=scGPT_dist_pretrain              # A nice readable name of your job, to see it in the queue
-#SBATCH --nodes=1                                     # Number of nodes to request
+#SBATCH --nodes=2                                     # Number of nodes to request
 #SBATCH --ntasks-per-node=2                           # total number of tasks per node
 #SBATCH --cpus-per-task=4                             # Number of CPUs to request
 #SBATCH --gres=gpu:a100:2                             # Number of GPUs to request
@@ -10,8 +10,8 @@
 #SBATCH --partition=ampere
 #SBATCH --output=/home/hauke.schuele/scGPT_distributed/logs/%x-%j.out  # File to which STDOUT will be written
 #SBATCH --error=/home/hauke.schuele/scGPT_distributed/logs/%x-%j.err   # File to which STDERR will be written
+#SBATCH --time=00:15:00              # Time limit (hh:mm:ss)
 echo ""
-#SBATCH --time=00:05:00              # Time limit (hh:mm:ss)
 
 module load mamba
 micromamba activate scgpt_manual
