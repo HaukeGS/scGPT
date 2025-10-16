@@ -75,6 +75,13 @@ def add_arguments(parser: argparse.ArgumentParser):
         help="Whether to enable streaming data loading. Default is False."
         "Expects a boolean flag like True/False or yes/no (case insensitive).",
     )
+    parser.add_argument(
+        "--interleaved",
+        type=str2bool,
+        default=False,
+        help="Whether the input data is interleaved across tissues. Only used if --streaming is True. Default is False."
+        "Expects a boolean flag like True/False or yes/no (case insensitive).",
+    )
 
     # settings for tokenizer
     parser.add_argument(
@@ -288,6 +295,8 @@ def validate_args(args: argparse.Namespace):
         raise ValueError("If --tissues is provided, --data-tissue-path must also be provided.")
     if args.tissues is None and args.data_tissue_path is not None:
         warnings.warn("--data-tissue-path is provided but --tissues is not. --data-tissue-path will be ignored.", UserWarning)
+    if args.tissues is None and args.interleaved is not None:
+        warnings.warn("--interleaved is provided but --tissues is not. --interleaved will be ignored.", UserWarning)
 
 
 def get_datapaths(args: argparse.Namespace) -> List[Path]:
@@ -309,20 +318,40 @@ def get_datapaths(args: argparse.Namespace) -> List[Path]:
         if args.data_tissue_path is None:
             raise ValueError("If --tissues is provided, --data-tissue-path must also be provided.")
         base_path = Path(args.data_tissue_path)
-        for tissue in args.tissues:
-            if args.streaming:
-                # Expect multiple sharded parquet files in a subdirectory named after the tissue
-                tissue_path = base_path / tissue
-                if not tissue_path.is_dir():
-                    raise ValueError(f"Expected directory for tissue '{tissue}' at {tissue_path}, but it does not exist or is not a directory.")
-                # we need to return the list of directories here and load the actual .parquet files in the create_dataset() function, because else we can't properly distribute the shards evenly across multiple GPUs
-                data_paths.append(tissue_path)
+        if args.streaming:
+            if args.interleaved:
+                # Expects a directory named after the sorted tissues joined with '-' containing multiple sharded parquet files (shard_***.parquet)
+                tissue_dir = "-".join(sorted(args.tissues))
+                interleaved_path = base_path / tissue_dir
+                if not interleaved_path.is_dir():
+                    raise ValueError(f"Expected directory for interleaved tissues at {interleaved_path}, but it does not exist or is not a directory.")
+                data_paths = [interleaved_path]
             else:
-                # Expect a single parquet file named after the tissue
-                tissue_file = base_path / f"{tissue}.parquet"
-                if not tissue_file.is_file():
-                    raise ValueError(f"Expected file for tissue '{tissue}' at {tissue_file}, but it does not exist.")
-                data_paths.append(tissue_file)
+                for tissue in args.tissues:
+                    # Expect multiple sharded parquet files in a subdirectory named after the tissue
+                    tissue_path = base_path / tissue
+                    if not tissue_path.is_dir():
+                        raise ValueError(f"Expected directory for tissue '{tissue}' at {tissue_path}, but it does not exist or is not a directory.")
+                    # we need to return the list of directories here and load the actual .parquet files in the create_dataset() function, because else we can't properly distribute the shards evenly across multiple GPUs
+                    data_paths.append(tissue_path)
+        else:
+            if args.interleaved:
+                # Expects multiple sharded parquet files (shard_***.parquet) in a directory named after the sorted tissues joined with '-'
+                tissue_dir = "-".join(sorted(args.tissues))
+                interleaved_path = base_path / tissue_dir
+                if not interleaved_path.is_dir():
+                    raise ValueError(f"Expected directory for interleaved tissues at {interleaved_path}, but it does not exist or is not a directory.")
+                globbed_files = list(interleaved_path.glob("shard_*.parquet"))
+                if len(globbed_files) == 0:
+                    raise ValueError(f"No sharded parquet files found in {interleaved_path}. Expected files named like shard_***.parquet.")
+                data_paths = sorted(globbed_files)
+            else:
+                for tissue in args.tissues:
+                    # Expect a single parquet file named after the tissue
+                    tissue_file = base_path / f"{tissue}.parquet"
+                    if not tissue_file.is_file():
+                        raise ValueError(f"Expected file for tissue '{tissue}' at {tissue_file}, but it does not exist.")
+                    data_paths.append(tissue_file)
 
     return data_paths
 

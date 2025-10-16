@@ -125,7 +125,7 @@ def get_tissue_sample_count(tissue: str) -> int:
     """
     Get the number of samples in the specified tissue.
     """
-    with open("total_dataset_sample_counts.json", "r") as f:
+    with open("/home/hauke.schuele/scGPT_distributed/total_dataset_sample_counts.json", "r") as f:
         example_numbers = json.load(f)
         if tissue not in example_numbers:
             raise KeyError(f"Tissue '{tissue}' not found in total_dataset_sample_counts.json")
@@ -139,7 +139,7 @@ def get_total_sample_counts(tissues: List[str]) -> int:
     """
     total_count = 0
     for tissue in tissues:
-        with open("total_dataset_sample_counts.json", "r") as f:
+        with open("/home/hauke.schuele/scGPT_distributed/total_dataset_sample_counts.json", "r") as f:
             example_numbers = json.load(f)
             if tissue not in example_numbers:
                 raise KeyError(f"Tissue '{tissue}' not found in total_dataset_sample_counts.json")
@@ -238,50 +238,21 @@ def create_datasets_streaming(
             validation_dataset = None
             printmaster(f"No validation shards found for path {path} because validation_ratio <= 0")
 
-        # for the validation set we will reshard the data again into more shards to be able to take a subset of it while still keeping a 
-
         train_datasets.append(train_dataset)
         if validation_dataset:
             validation_datasets.append(validation_dataset)
         printmaster(f"tissue: {path} train_dataset.n_shards: {train_dataset.n_shards}")
         printmaster(f"tissue: {path} validation_dataset.n_shards: {validation_dataset.n_shards if validation_dataset else 0}")
 
-
-    # def interleave_until_all_exhausted(datasets):
-    #     iterators = [iter(ds) for ds in datasets]
-    #     active = [True] * len(datasets)
-    #     while any(active):
-    #         for i, it in enumerate(iterators):
-    #             if not active[i]:
-    #                 continue
-    #             try:
-    #                 yield next(it)
-    #             except StopIteration:
-    #                 active[i] = False
-
-
-    # train_dataset = IterableDataset.from_generator(lambda: interleave_until_all_exhausted(train_datasets))
-    # validation_dataset = IterableDataset.from_generator(lambda: interleave_until_all_exhausted(validation_datasets))
-
-    # printmaster(f"Number of training datasets to concatenate: {len(train_datasets)}")
-    # train_dataset = concatenate_datasets(train_datasets) if len(train_datasets) > 1 else train_datasets[0]
-    printmaster(f"Number of training datasets to interleave: {len(train_datasets)}")
-    # train_dataset = interleave_datasets(train_datasets, seed=SEED, stopping_strategy="all_exhausted_without_replacement") if len(train_datasets) > 1 else train_datasets[0]
-    sample_counts = [get_tissue_sample_count(tissue) for tissue in TISSUES]
-    probabilities = [sample_count / sum(sample_counts) for sample_count in sample_counts]
-    stopping_strategy = "first_exhausted"
-    # stopping_strategy = "all_exhausted"
-    # printmaster(f"Interleaving datasets with stopping strategy {stopping_strategy} with probabilities: {probabilities}, sum: {sum(probabilities)}")
-    printmaster(f"Interleaving datasets with stopping strategy {stopping_strategy}, without probabilities")
-    train_dataset = interleave_datasets(train_datasets, seed=SEED, stopping_strategy=stopping_strategy) if len(train_datasets) > 1 else train_datasets[0]
+    printmaster(f"Number of training datasets to concatenate: {len(train_datasets)}")
+    train_dataset = concatenate_datasets(train_datasets) if len(train_datasets) > 1 else train_datasets[0]
     train_dataset = train_dataset.with_format("torch")
     printmaster(f"total train_dataset.n_shards: {train_dataset.n_shards}")
 
 
     if len(validation_datasets) > 0:
         printmaster(f"Number of validation datasets to concatenate: {len(validation_datasets)}")
-        # validation_dataset = concatenate_datasets(validation_datasets) if len(validation_datasets) > 1 else validation_datasets[0]
-        validation_dataset = interleave_datasets(validation_datasets, seed=SEED, stopping_strategy=stopping_strategy) if len(validation_datasets) > 1 else validation_datasets[0]
+        validation_dataset = concatenate_datasets(validation_datasets) if len(validation_datasets) > 1 else validation_datasets[0]
         validation_dataset = validation_dataset.with_format("torch") if validation_dataset else None
         printmaster(f"total validation_dataset.n_shards: {validation_dataset.n_shards}")
     else:
@@ -367,7 +338,7 @@ def create_dataloaders(train_dataset: Dataset, validation_dataset: Dataset, batc
         train_loader = DataLoader(
             train_dataset,
             batch_size=batch_size,
-            num_workers=min(CPUS_PER_TASK, 24 // WORLD_SIZE),
+            num_workers=min(CPUS_PER_TASK, train_dataset.n_shards),
             pin_memory=True,
             drop_last=True,
             collate_fn=collator,
@@ -377,7 +348,7 @@ def create_dataloaders(train_dataset: Dataset, validation_dataset: Dataset, batc
             validation_loader = DataLoader(
                 validation_dataset,
                 batch_size=batch_size,
-                num_workers=min(CPUS_PER_TASK, len(TISSUES)),
+                num_workers=min(CPUS_PER_TASK, validation_dataset.n_shards),
                 pin_memory=True,
                 drop_last=False,
                 collate_fn=collator,

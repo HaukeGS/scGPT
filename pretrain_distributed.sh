@@ -2,7 +2,7 @@
 
 # See `man sbatch` or https://slurm.schedmd.com/sbatch.html for descriptions of sbatch options.
 #SBATCH --job-name=scGPT_dist_pretrain              # A nice readable name of your job, to see it in the queue
-#SBATCH --nodes=2                                     # Number of nodes to request
+#SBATCH --nodes=1                                     # Number of nodes to request
 #SBATCH --ntasks-per-node=2                           # total number of tasks per node
 #SBATCH --cpus-per-task=4                             # Number of CPUs to request
 #SBATCH --gres=gpu:a100:2                             # Number of GPUs to request
@@ -10,8 +10,8 @@
 #SBATCH --partition=ampere
 #SBATCH --output=/home/hauke.schuele/scGPT_distributed/logs/%x-%j.out  # File to which STDOUT will be written
 #SBATCH --error=/home/hauke.schuele/scGPT_distributed/logs/%x-%j.err   # File to which STDERR will be written
-#SBATCH --time=00:15:00              # Time limit (hh:mm:ss)
 echo ""
+#SBATCH --time=00:15:00              # Time limit (hh:mm:ss)
 
 module load mamba
 micromamba activate scgpt_manual
@@ -29,10 +29,11 @@ echo "WORLD_SIZE=$WORLD_SIZE"
 
 
 # Script parameters
-streaming="true"
+streaming="false"
+interleaved="true"
 
-if [ "$streaming" = "true" ]; then
-    DATA_TISSUE_PATH="/home/hauke.schuele/cellxgene_data_sharded_validation/"
+if [ "$interleaved" = "true" ]; then
+    DATA_TISSUE_PATH="/home/hauke.schuele/cellxgene_data_interleaved/"
 else
     DATA_TISSUE_PATH="/home/hauke.schuele/cellxgene_data/"
 fi
@@ -42,16 +43,18 @@ fi
 # TISSUES=("pan-cancer")  # try to use smaller datasets for now
 TISSUES=("blood" "kidney" "pancreas" "intestine")  # try to use two datasets and monitor I/O operations
 # TISSUES=("blood" "brain" "heart" "intestine" "kidney" "lung" "others" "pan-cancer" "pancreas")
-DATA_SOURCES=()
+IFS=$'\n' TISSUES=($(printf '%s\n' "${TISSUES[@]}" | sort))
+echo "Sorted tissues: ${TISSUES[@]}"
+# DATA_SOURCES=()
 
-for TISSUE in "${TISSUES[@]}"; do
-    DATA_SOURCES+=("/data/datasets/biology/scGPT-data/preprocessed/$TISSUE/all_counts/cls_prefix_data.parquet")
-done
+# for TISSUE in "${TISSUES[@]}"; do
+#     DATA_SOURCES+=("/data/datasets/biology/scGPT-data/preprocessed/$TISSUE/all_counts/cls_prefix_data.parquet")
+# done
 
 srun python -u scGPT_distributed/pretrain_distributed.py \
     --tissues "${TISSUES[@]}" \
     --data-tissue-path "$DATA_TISSUE_PATH" \
-    --epochs 1 \
+    --epochs 2 \
     --training-tasks "both" \
     --save-dir ./save/pretrain-distributed-[$SLURM_JOB_ID]-$(date +%Y-%m-%d_%H-%M-%S) \
     --vocab-path "/data/datasets/biology/scGPT-data/preprocessed/default_census_vocab.json" \
@@ -63,3 +66,4 @@ srun python -u scGPT_distributed/pretrain_distributed.py \
     --no-cce \
     --fp16 \
     --streaming "$streaming" \
+    --interleaved "$interleaved" \
