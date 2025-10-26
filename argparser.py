@@ -34,6 +34,13 @@ def add_arguments(parser: argparse.ArgumentParser):
         help="The base path where the .parquet files for the tissues are stored. See --tissues for more details.",
     )
     parser.add_argument(
+        "--cache-dir",
+        type=str,
+        default=None,
+        help="The directory to use for caching streaming datasets. If not provided, a 'cache' subdirectory will be created in the same directory as the data files.",
+    )
+     # settings for saving and loading models
+    parser.add_argument(
         "-s",
         "--save-dir",
         type=str,
@@ -304,56 +311,43 @@ def get_datapaths(args: argparse.Namespace) -> List[Path]:
     Get the data sources from the command line arguments.
     We can specify either one or multiple data_sources, so this function returns a uniform data structure.
     """
-    data_paths = []
+    datapaths = []
     # Check which data source argument was provided
     if args.data_source is not None:
         # Single data source provided
-        data_paths = [Path(args.data_source)]  # Convert to list for uniform processing
+        datapaths = [Path(args.data_source)]  # Convert to list for uniform processing
 
     elif args.data_sources is not None:
         # Multiple data sources provided
-        data_paths = [Path(ds) for ds in args.data_sources]  # Convert to list of Paths
+        datapaths = [Path(ds) for ds in args.data_sources]  # Convert to list of Paths
 
     elif args.tissues is not None:
         if args.data_tissue_path is None:
             raise ValueError("If --tissues is provided, --data-tissue-path must also be provided.")
-        base_path = Path(args.data_tissue_path)
-        if args.streaming:
-            if args.interleaved:
-                # Expects a directory named after the sorted tissues joined with '-' containing multiple sharded parquet files (shard_***.parquet)
-                tissue_dir = "-".join(sorted(args.tissues))
-                interleaved_path = base_path / tissue_dir
-                if not interleaved_path.is_dir():
-                    raise ValueError(f"Expected directory for interleaved tissues at {interleaved_path}, but it does not exist or is not a directory.")
-                data_paths = [interleaved_path]
-            else:
-                for tissue in args.tissues:
-                    # Expect multiple sharded parquet files in a subdirectory named after the tissue
-                    tissue_path = base_path / tissue
-                    if not tissue_path.is_dir():
-                        raise ValueError(f"Expected directory for tissue '{tissue}' at {tissue_path}, but it does not exist or is not a directory.")
-                    # we need to return the list of directories here and load the actual .parquet files in the create_dataset() function, because else we can't properly distribute the shards evenly across multiple GPUs
-                    data_paths.append(tissue_path)
+        if args.interleaved:    
+            tissue_dir = "-".join(sorted(args.tissues))
+            interleaved_path = Path(f"{args.data_tissue_path}/{tissue_dir}")
+            if not interleaved_path.is_dir():
+                raise ValueError(f"Expected directory for interleaved tissues at {interleaved_path}, but it does not exist or is not a directory.")
+            datapaths = list(interleaved_path.glob("shard_*.parquet"))
         else:
-            if args.interleaved:
-                # Expects multiple sharded parquet files (shard_***.parquet) in a directory named after the sorted tissues joined with '-'
-                tissue_dir = "-".join(sorted(args.tissues))
-                interleaved_path = base_path / tissue_dir
-                if not interleaved_path.is_dir():
-                    raise ValueError(f"Expected directory for interleaved tissues at {interleaved_path}, but it does not exist or is not a directory.")
-                globbed_files = list(interleaved_path.glob("shard_*.parquet"))
-                if len(globbed_files) == 0:
-                    raise ValueError(f"No sharded parquet files found in {interleaved_path}. Expected files named like shard_***.parquet.")
-                data_paths = sorted(globbed_files)
-            else:
+            if args.streaming:
+                raise DeprecationWarning("Streaming mode with --tissues is deprecated. Please use interleaved mode instead.")
+                # for tissue in args.tissues:
+                    # tissue_path = Path(f"{args.data_tissue_path}/{tissue}")
+                    # if not tissue_path.is_dir():
+                    #     raise ValueError(f"Expected directory for tissue '{tissue}' at {tissue_path}, but it does not exist or is not a directory.")
+                    # shards = list(tissue_path.glob("shard_*.parquet"))
+                    # datapaths.extend(shards)
+            else:        
                 for tissue in args.tissues:
-                    # Expect a single parquet file named after the tissue
-                    tissue_file = base_path / f"{tissue}.parquet"
+                    tissue_file = Path(f"{args.data_tissue_path}/{tissue}.parquet")
                     if not tissue_file.is_file():
                         raise ValueError(f"Expected file for tissue '{tissue}' at {tissue_file}, but it does not exist.")
-                    data_paths.append(tissue_file)
+                    datapaths.append(tissue_file)
+        datapaths = [str(path) for path in datapaths]
+        return datapaths
 
-    return data_paths
 
 
 def float_in_range_0_1(value: str) -> float:

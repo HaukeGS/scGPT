@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # See `man sbatch` or https://slurm.schedmd.com/sbatch.html for descriptions of sbatch options.
-#SBATCH --job-name=scGPT_dist_pretrain              # A nice readable name of your job, to see it in the queue
+#SBATCH --job-name=scGPT_pretrain              # Gets overwritten by run_and_monitor_job.sh!
 #SBATCH --nodes=1                                     # Number of nodes to request
 #SBATCH --ntasks-per-node=2                           # total number of tasks per node
 #SBATCH --cpus-per-task=4                             # Number of CPUs to request
@@ -10,8 +10,8 @@
 #SBATCH --partition=ampere
 #SBATCH --output=/home/hauke.schuele/scGPT_distributed/logs/%x-%j.out  # File to which STDOUT will be written
 #SBATCH --error=/home/hauke.schuele/scGPT_distributed/logs/%x-%j.err   # File to which STDERR will be written
+#SBATCH --time=02:00:00              # Time limit (hh:mm:ss)
 echo ""
-#SBATCH --time=00:15:00              # Time limit (hh:mm:ss)
 
 module load mamba
 micromamba activate scgpt_manual
@@ -29,22 +29,45 @@ echo "WORLD_SIZE=$WORLD_SIZE"
 
 
 # Script parameters
-streaming="false"
+streaming="true"
 interleaved="true"
 
+# Tissue selection based on data percentage
+data_percentage="$1"
+if [ -z "$data_percentage" ]; then
+    echo "No data percentage provided. Using default: 10%"
+    data_percentage="10"
+elif [ "$data_percentage" != "10" ] && [ "$data_percentage" != "50" ] && [ "$data_percentage" != "100" ]; then
+    echo "Invalid data percentage provided: $data_percentage. Allowed values are 10, 50, or 100."
+    echo "Using default: 10%"
+    data_percentage="10"
+else
+    echo "Data percentage provided: $data_percentage%"
+fi
+
+if [ "$data_percentage" = "10" ]; then
+    TISSUES=("heart" "lung")
+elif [ "$data_percentage" = "50" ]; then
+    TISSUES=("heart" "intestine" "kidney" "lung" "others" "pancreas")
+elif [ "$data_percentage" = "100" ]; then
+    TISSUES=("blood" "brain" "heart" "intestine" "kidney" "lung" "others" "pan-cancer" "pancreas")
+fi
+IFS=$'\n' TISSUES=($(printf '%s\n' "${TISSUES[@]}" | sort))
+echo "Sorted tissues: ${TISSUES[@]}"
+
+
+# Data paths
 if [ "$interleaved" = "true" ]; then
     DATA_TISSUE_PATH="/home/hauke.schuele/cellxgene_data_interleaved/"
 else
-    DATA_TISSUE_PATH="/home/hauke.schuele/cellxgene_data/"
+    if [ "$streaming" = "true" ]; then
+        echo "Using streaming with non-interleaved data is no more supported. Exiting."
+        exit 1
+    else
+        DATA_TISSUE_PATH="/home/hauke.schuele/cellxgene_data/"
+    fi
 fi
 
-# scGPT parameters
-# TISSUES=("kidney")  # try to use smaller datasets for now
-# TISSUES=("pan-cancer")  # try to use smaller datasets for now
-TISSUES=("blood" "kidney" "pancreas" "intestine")  # try to use two datasets and monitor I/O operations
-# TISSUES=("blood" "brain" "heart" "intestine" "kidney" "lung" "others" "pan-cancer" "pancreas")
-IFS=$'\n' TISSUES=($(printf '%s\n' "${TISSUES[@]}" | sort))
-echo "Sorted tissues: ${TISSUES[@]}"
 # DATA_SOURCES=()
 
 # for TISSUE in "${TISSUES[@]}"; do
@@ -54,11 +77,13 @@ echo "Sorted tissues: ${TISSUES[@]}"
 srun python -u scGPT_distributed/pretrain_distributed.py \
     --tissues "${TISSUES[@]}" \
     --data-tissue-path "$DATA_TISSUE_PATH" \
-    --epochs 2 \
+    --epochs 1 \
     --training-tasks "both" \
     --save-dir ./save/pretrain-distributed-[$SLURM_JOB_ID]-$(date +%Y-%m-%d_%H-%M-%S) \
     --vocab-path "/data/datasets/biology/scGPT-data/preprocessed/default_census_vocab.json" \
+    --cache-dir "/home/hauke.schuele/datasets_cache" \
     --save-interval 5000 \
+    --log-interval 250 \
     --batch-size 128 \
     --valid-ratio 0.04 \
     --trunc-by-sample \

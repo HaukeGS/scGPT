@@ -16,13 +16,9 @@ from pathlib import Path
 from typing import List, Tuple, Dict, Union, Optional
 
 # torch relevant imports
-import scanpy as sc
-import numpy as np
 import torch
 import transformers
-import hashlib
 from torch import nn
-from torch.nn import functional as F
 from torch.utils.tensorboard import SummaryWriter
 from torch.utils.data import DataLoader, BatchSampler, RandomSampler, SequentialSampler
 from datasets import Dataset, load_dataset, concatenate_datasets, interleave_datasets, IterableDataset
@@ -34,11 +30,8 @@ from torch.utils.data.distributed import DistributedSampler
 # scgpt imports
 import scgpt as scg
 from scgpt.model import TransformerModel
-from scgpt.streamingdataloaderwrapper import StreamingDataLoaderWrapper
 from scgpt.loss import masked_mse_loss, masked_relative_error
 from scgpt.tokenizer import GeneVocab, random_mask_value
-from scgpt.scbank import DataBank
-from scgpt.utils import MainProcessOnly
 from scgpt import logger
 
 import argparser
@@ -169,12 +162,12 @@ def create_datasets_streaming(
     data_paths: List[str], 
     validation_ratio: float,
     subset_ratio: float = 1.0,
+    cache_dir: Optional[Path] = None,
 ) -> Tuple[Dataset, Dataset]:
     """
     Load the dataset from the specified data source in streaming mode.
-    data_source can contain multiple directories. See argparser.py for more details
-    This assumes one or more directories with a preprocessed cls_prefix_data.parquet file. 
-    Returns an interleaved training dataset and a validation dataset from all directories.
+    data_source is a list of .parquet files. 
+    Each file is assumed to be a shard of the dataset and should be of equal size.
 
     args:
         data_paths: List[Path]: 
@@ -195,6 +188,11 @@ def create_datasets_streaming(
     """
     if not data_paths:
         raise ValueError("No data_paths provided")
+    if not cache_dir:
+        cache_dir = Path(data_paths[0]).parent / "cache"
+    elif not Path(cache_dir).is_dir():
+        os.makedirs(cache_dir, exist_ok=True)
+        cache_dir = str(cache_dir)
     if subset_ratio < 1.0:
         raise ValueError("subset_ratio < 1.0 not yet supported for streaming datasets")
         # TODO: implement subset_ratio for streaming datasets
@@ -202,47 +200,47 @@ def create_datasets_streaming(
     train_datasets = []
     validation_datasets = []
 
-    for path in data_paths:
-        files = list(path.glob("shard_*.parquet"))
-        if not files:
-            raise FileNotFoundError(f"No shards found for path {path}")
-        random.shuffle(files)
-        validation_threshold = math.ceil(len(files) * validation_ratio) if validation_ratio > 0 else 0
-        training_files = files[validation_threshold:]
-        validation_files = files[:validation_threshold] if validation_ratio > 0 else []
-        training_shards = [str(file) for i, file in enumerate(training_files) if (i % WORLD_SIZE) == GLOBAL_RANK]
-        validation_shards = [str(file) for file in validation_files]
-        printgpu(f"Found {len(files)} shards in {path} with {len(training_shards)} training shards and {len(validation_files)} validation shards assigned to this GPU (rank {GLOBAL_RANK})")
-        printgpu(f"validation shards: {validation_shards}")
+    # DEBUGGING
+    # files = [file for file in files if "shard_022.parquet" in str(file)or "shard_023.parquet" in str(file)]
 
-        if not training_shards:
-            raise FileNotFoundError(f"No shards found for path {path} on rank {GLOBAL_RANK}")
+    random.shuffle(data_paths)
+    validation_threshold = math.ceil(len(data_paths) * validation_ratio) if validation_ratio > 0 else 0
+    training_files = data_paths[validation_threshold:]
+    validation_files = data_paths[:validation_threshold] if validation_ratio > 0 else []
+    training_shards = [str(file) for i, file in enumerate(training_files) if (i % WORLD_SIZE) == GLOBAL_RANK]
+    validation_shards = [str(file) for file in validation_files]
+    printmaster(f"Using cache directory at {cache_dir}")
+    printgpu(f"training_shards: {json.dumps(training_shards, indent=2)}")
+    printgpu(f"validation_shards: {json.dumps(validation_shards, indent=2)}")
 
-        train_dataset = load_dataset(
+    if not training_shards:
+        raise FileNotFoundError(f"No shards found on rank {GLOBAL_RANK}")
+
+    train_dataset = load_dataset(
+        "parquet",
+        data_files=training_shards,
+        split="train",  # specify train to load all the data into a dataset directly and not a dataset dict
+        cache_dir=cache_dir,
+    )
+    printgpu(f"Loaded training dataset with {len(train_dataset)} samples on rank {GLOBAL_RANK}")
+    train_dataset = train_dataset.to_iterable_dataset()
+
+    if len(validation_files) > 0:
+        validation_dataset = load_dataset(
             "parquet",
-            data_files=training_shards,
+            data_files=validation_shards,
             split="train",  # specify train to load all the data into a dataset directly and not a dataset dict
-            cache_dir=str(path / "cache"),
-            streaming=True,  # to avoid loading all data into memory at once
+            cache_dir=cache_dir,
         )
+        printgpu(f"Loaded validation dataset with {len(validation_dataset)} samples on rank {GLOBAL_RANK}")
+        validation_dataset = validation_dataset.to_iterable_dataset()
+    else:
+        validation_dataset = None
+        printmaster(f"No validation shards found because validation_ratio <= 0")
 
-        if len(validation_files) > 0:
-            validation_dataset = load_dataset(
-                "parquet",
-                data_files=validation_shards,
-                split="train",  # specify train to load all the data into a dataset directly and not a dataset dict
-                cache_dir=str(path / "cache"),
-                streaming=True,  # to avoid loading all data into memory at once
-            )
-        else:
-            validation_dataset = None
-            printmaster(f"No validation shards found for path {path} because validation_ratio <= 0")
-
-        train_datasets.append(train_dataset)
-        if validation_dataset:
-            validation_datasets.append(validation_dataset)
-        printmaster(f"tissue: {path} train_dataset.n_shards: {train_dataset.n_shards}")
-        printmaster(f"tissue: {path} validation_dataset.n_shards: {validation_dataset.n_shards if validation_dataset else 0}")
+    train_datasets.append(train_dataset)
+    if validation_dataset:
+        validation_datasets.append(validation_dataset)
 
     printmaster(f"Number of training datasets to concatenate: {len(train_datasets)}")
     train_dataset = concatenate_datasets(train_datasets) if len(train_datasets) > 1 else train_datasets[0]
@@ -262,7 +260,7 @@ def create_datasets_streaming(
     return train_dataset, validation_dataset
 
 
-def create_datasets(data_paths: List[Path], validation_ratio: float = 0.0, subset_ratio: float = 1.0) -> Tuple[Dataset, Dataset]:
+def create_datasets(data_paths: List[Path], cache_dir: Optional[Path] = None, validation_ratio: float = 0.0, subset_ratio: float = 1.0) -> Tuple[Dataset, Dataset]:
     """
     Load the dataset from the specified data source.
     data_source can contain multiple directories. See argparser.py for more details
@@ -271,6 +269,11 @@ def create_datasets(data_paths: List[Path], validation_ratio: float = 0.0, subse
     """
     if not data_paths:
         raise ValueError("No data paths provided")
+    if not cache_dir:
+        cache_dir = Path(data_paths[0]).parent / "cache"
+    elif not Path(cache_dir).is_dir():
+        os.makedirs(cache_dir, exist_ok=True)
+        cache_dir = str(cache_dir)
     datasets = []
     example_count = 0
     for file in data_paths:
@@ -281,7 +284,7 @@ def create_datasets(data_paths: List[Path], validation_ratio: float = 0.0, subse
             "parquet",
             data_files=str(file),
             split="train",  # specify train to load all the data into a dataset directly and not a dataset dict
-            cache_dir=str(file.parent / "cache"),
+            cache_dir=cache_dir,
         )
         if subset_ratio < 1.0:
             subset_size = int(len(raw_dataset) * subset_ratio)
@@ -401,19 +404,17 @@ def get_dataloaders(
         batch_size: int,
         subset_ratio: float = 1.0,
         streaming: bool = False,
+        cache_dir: Optional[Path] = None,
     ) -> Tuple[DataLoader, DataLoader]:
     """
     Get the dataloaders for training and validation datasets.
     """
     if not streaming:
-        train_dataset, validation_dataset = create_datasets(data_paths, validation_ratio=validation_ratio, subset_ratio=subset_ratio)
+        train_dataset, validation_dataset = create_datasets(data_paths, cache_dir=cache_dir, validation_ratio=validation_ratio, subset_ratio=subset_ratio)
         printmaster(f"Final training dataset length: {len(train_dataset)}")
         printmaster(f"Final validation dataset length: {len(validation_dataset)}")
     else:
-        train_dataset, validation_dataset = create_datasets_streaming(data_paths, subset_ratio=subset_ratio, validation_ratio=validation_ratio)
-        sample_count = get_total_sample_counts(TISSUES) if TISSUES is not None else None
-        printmaster("Initialized streaming train datasets with approximate sample count: " + (f"{sample_count * (1-validation_ratio)}" if sample_count is not None else "unknown"))
-        printmaster("Initialized streaming validation datasets with approximate sample count: " + (f"{sample_count * validation_ratio}" if sample_count is not None else "unknown"))
+        train_dataset, validation_dataset = create_datasets_streaming(data_paths, cache_dir=cache_dir, subset_ratio=subset_ratio, validation_ratio=validation_ratio)
     collator = create_collator(
         vocab=vocab,
         max_seq_len=max_seq_len,
@@ -687,6 +688,8 @@ def pretrain_streaming(
                 )
             global_iter += 1
 
+        printgpu(f"Finished epoch {epoch+1}/{num_epochs} and waiting for other GPUs to catch up...")
+        dist.barrier()
     writer.close()
     printmaster("Training complete.")
 
@@ -988,6 +991,7 @@ def initialize_additional_arguments(args: argparse.Namespace) -> argparse.Namesp
     if args.training_tasks in ["gen", "both"]:
         printmaster(f"args.mask_ratio: {args.mask_ratio} (can be float or list of floats)")
         # args.mask_ratio = [0.25, 0.50, 0.75]
+    args.datapaths = argparser.get_datapaths(args)
     return args
 
 
@@ -1021,7 +1025,7 @@ def main():
         vocab = get_vocabulary(Path(args.vocab_path))
         dump_vocab(vocab)
         train_loader, validation_loader = get_dataloaders(
-            data_paths=argparser.get_datapaths(args), 
+            data_paths=args.datapaths,
             validation_ratio=args.valid_ratio, 
             vocab=vocab,
             max_seq_len=args.max_seq_len,
@@ -1035,6 +1039,7 @@ def main():
             batch_size=args.batch_size,
             subset_ratio=args.subset_ratio,
             streaming=args.streaming,
+            cache_dir=args.cache_dir,
         )
         dist.barrier()
         time.sleep(2)
@@ -1088,6 +1093,7 @@ def main():
                 scaler=torch.cuda.amp.GradScaler(enabled=args.fp16),
                 grad_accu_steps=args.grad_accu_steps,
             )
+            printgpu("Returned to main")
         else:
             pretrain(
                 model=ddp_model,
