@@ -296,6 +296,12 @@ def add_arguments(parser: argparse.ArgumentParser):
         default=1000,
         help="The interval for saving the model. Default is 1000.",
     )
+    parser.add_argument(
+        "--separate-gpu-log-files",
+        action="store_true",
+        help="Whether to create separate log files for each GPU in distributed "
+        "training. Default is False.",
+    )
 
 def validate_args(args: argparse.Namespace):
     if args.tissues is not None and args.data_tissue_path is None:
@@ -332,13 +338,13 @@ def get_datapaths(args: argparse.Namespace) -> List[Path]:
             datapaths = list(interleaved_path.glob("shard_*.parquet"))
         else:
             if args.streaming:
-                raise DeprecationWarning("Streaming mode with --tissues is deprecated. Please use interleaved mode instead.")
-                # for tissue in args.tissues:
-                    # tissue_path = Path(f"{args.data_tissue_path}/{tissue}")
-                    # if not tissue_path.is_dir():
-                    #     raise ValueError(f"Expected directory for tissue '{tissue}' at {tissue_path}, but it does not exist or is not a directory.")
-                    # shards = list(tissue_path.glob("shard_*.parquet"))
-                    # datapaths.extend(shards)
+                # raise DeprecationWarning("Streaming mode with --tissues is deprecated. Please use interleaved mode instead.")
+                for tissue in args.tissues:
+                    tissue_path = Path(f"{args.data_tissue_path}/{tissue}")
+                    if not tissue_path.is_dir():
+                        raise ValueError(f"Expected directory for tissue '{tissue}' at {tissue_path}, but it does not exist or is not a directory.")
+                    shards = list(tissue_path.glob("shard_*.parquet"))
+                    datapaths.extend(shards)
             else:        
                 for tissue in args.tissues:
                     tissue_file = Path(f"{args.data_tissue_path}/{tissue}.parquet")

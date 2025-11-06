@@ -3,15 +3,15 @@
 # See `man sbatch` or https://slurm.schedmd.com/sbatch.html for descriptions of sbatch options.
 #SBATCH --job-name=scGPT_pretrain              # Gets overwritten by run_and_monitor_job.sh!
 #SBATCH --nodes=1                                     # Number of nodes to request
-#SBATCH --ntasks-per-node=2                           # total number of tasks per node
+#SBATCH --ntasks-per-node=4                           # total number of tasks per node
 #SBATCH --cpus-per-task=4                             # Number of CPUs to request
-#SBATCH --gres=gpu:a100:2                             # Number of GPUs to request
+#SBATCH --gres=gpu:a100:4                             # Number of GPUs to request
 #SBATCH --mem-per-gpu=4GB
 #SBATCH --partition=ampere
 #SBATCH --output=/home/hauke.schuele/scGPT_distributed/logs/%x-%j.out  # File to which STDOUT will be written
 #SBATCH --error=/home/hauke.schuele/scGPT_distributed/logs/%x-%j.err   # File to which STDERR will be written
-#SBATCH --time=02:00:00              # Time limit (hh:mm:ss)
 echo ""
+#SBATCH --time=02:00:00              # Time limit (hh:mm:ss)
 
 module load mamba
 micromamba activate scgpt_manual
@@ -48,7 +48,7 @@ fi
 if [ "$data_percentage" = "10" ]; then
     TISSUES=("heart" "lung")
 elif [ "$data_percentage" = "50" ]; then
-    TISSUES=("heart" "intestine" "kidney" "lung" "others" "pancreas")
+    TISSUES=("lung" "others" "pan-cancer")
 elif [ "$data_percentage" = "100" ]; then
     TISSUES=("blood" "brain" "heart" "intestine" "kidney" "lung" "others" "pan-cancer" "pancreas")
 fi
@@ -61,8 +61,9 @@ if [ "$interleaved" = "true" ]; then
     DATA_TISSUE_PATH="/home/hauke.schuele/cellxgene_data_interleaved/"
 else
     if [ "$streaming" = "true" ]; then
-        echo "Using streaming with non-interleaved data is no more supported. Exiting."
-        exit 1
+        DATA_TISSUE_PATH="/home/hauke.schuele/cellxgene_data_sharded_validation/"
+        # echo "Using streaming with non-interleaved data is no more supported. Exiting."
+        # exit 1
     else
         DATA_TISSUE_PATH="/home/hauke.schuele/cellxgene_data/"
     fi
@@ -82,7 +83,7 @@ srun python -u scGPT_distributed/pretrain_distributed.py \
     --save-dir ./save/pretrain-distributed-[$SLURM_JOB_ID]-$(date +%Y-%m-%d_%H-%M-%S) \
     --vocab-path "/data/datasets/biology/scGPT-data/preprocessed/default_census_vocab.json" \
     --cache-dir "/home/hauke.schuele/datasets_cache" \
-    --save-interval 5000 \
+    --save-interval 10000 \
     --log-interval 250 \
     --batch-size 128 \
     --valid-ratio 0.04 \

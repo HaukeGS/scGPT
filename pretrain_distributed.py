@@ -14,6 +14,7 @@ from socket import gethostname
 from datetime import timedelta
 from pathlib import Path
 from typing import List, Tuple, Dict, Union, Optional
+import pyarrow.parquet as pq
 
 # torch relevant imports
 import torch
@@ -64,8 +65,14 @@ def printgpu(string: str, flush: bool = True):
     """
     Print a message with infos about which GPU is being used.
     """
-    output = f"[GPU:{GLOBAL_RANK}][{NODE_ID}:{LOCAL_RANK}] {string}"
-    printtime(output, flush=flush)
+    if SEPARATE_LOG_FILES:
+        with open(SAVE_DIR / f"GPU[{GLOBAL_RANK}]_log.txt", "a") as f:
+            current_runtime = time.time() - runtime_startTime
+            current_runtime = str(timedelta(seconds=int(current_runtime)))
+            f.write(f"[{current_runtime}]|[GPU:{GLOBAL_RANK}][{NODE_ID}:{LOCAL_RANK}] {string}\n")
+    else:
+        output = f"[GPU:{GLOBAL_RANK}][{NODE_ID}:{LOCAL_RANK}] {string}"
+        printtime(output, flush=flush)
 
 
 def dump_args(args: argparse.Namespace) -> None:
@@ -126,43 +133,81 @@ def get_tissue_sample_count(tissue: str) -> int:
             return example_numbers[tissue]
 
 
-def get_total_sample_counts(tissues: List[str]) -> int:
+def get_total_sample_counts(data_paths: List[str]) -> int:
     """
     Get the total number of samples in the dataset.
     """
     total_count = 0
-    for tissue in tissues:
-        with open("/home/hauke.schuele/scGPT_distributed/total_dataset_sample_counts.json", "r") as f:
-            example_numbers = json.load(f)
-            if tissue not in example_numbers:
-                raise KeyError(f"Tissue '{tissue}' not found in total_dataset_sample_counts.json")
-            else:
-                count = example_numbers[tissue]
-            total_count += count
+    for path in data_paths:
+        total_count += pq.ParquetFile(path).metadata.num_rows
     return total_count
 
 
-def get_total_batch_count(tissues: List[str], batch_size: int) -> int:
+def get_total_batch_count(data_paths: List[str], batch_size: int) -> int:
     """
     Get the total number of batches in the dataset.
     """
-    total_count = get_total_sample_counts(tissues)
+    total_count = get_total_sample_counts(data_paths)
     return total_count // batch_size
 
 
-def get_total_batch_count_per_GPU(tissues: List[str], batch_size: int) -> int:
+def get_total_batch_count_per_GPU(data_paths: List[str], batch_size: int) -> int:
     """
     Get the total number of batches in the dataset per GPU.
     """
-    total_count = get_total_sample_counts(tissues)
+    total_count = get_total_sample_counts(data_paths)
     return total_count // (batch_size * WORLD_SIZE)
+
+
+def validate_data_paths(data_paths: List[Path]) -> None:
+    """
+    Validate that the data paths exist.
+    """
+    for path in data_paths:
+        if not path.exists():
+            raise FileNotFoundError(f"Data path '{path}' does not exist.")
+        if not path.is_file():
+            raise ValueError(f"Data path '{path}' is not a file.")
+    if len(data_paths) % WORLD_SIZE != 0:
+        raise ValueError(f"Number of data paths ({len(data_paths)}) is not divisible by WORLD_SIZE ({WORLD_SIZE}).")
+    num_rows = pq.ParquetFile(data_paths[0]).metadata.num_rows
+    for path in data_paths[1:]:
+        if pq.ParquetFile(path).metadata.num_rows != num_rows:
+            raise ValueError(f"Data path '{path}' has a different number of rows ({pq.ParquetFile(path).metadata.num_rows}) than the first data path ({num_rows}).")
+
+
+def validate_shard_distribution(shards: List[str], shard_type: str = "") -> None:
+    """
+    Validate that the shards are evenly distributed across GPUs.
+    """
+    if not dist.is_initialized():
+        raise ValueError("Distributed not initialized")
+    count = torch.tensor(len(shards), device=LOCAL_RANK, dtype=torch.long)
+
+    gathered_shards = [torch.zeros_like(count) for _ in range(WORLD_SIZE)]
+    dist.all_gather(gathered_shards, count)
+    if not all(count.item() == gathered_shards[0].item() for count in gathered_shards):
+        raise ValueError(f"Shards are not evenly distributed across GPUs: {gathered_shards}")
+    
+    
+def validate_sample_distribution(shards: List[str], sample_type: str = "") -> None:
+    """
+    Validate that the samples are evenly distributed across GPUs.
+    """
+    if not dist.is_initialized():
+        raise ValueError("Distributed not initialized")
+    total_size = torch.tensor(sum(pq.ParquetFile(path).metadata.num_rows for path in shards), device=LOCAL_RANK, dtype=torch.long)
+    gathered_sizes = [torch.zeros_like(total_size) for _ in range(WORLD_SIZE)]
+    dist.all_gather(gathered_sizes, total_size)
+    if not all(size.item() == gathered_sizes[0].item() for size in gathered_sizes):
+        raise ValueError(f"Samples are not evenly distributed across GPUs: {gathered_sizes}")
+
 
 
 def create_datasets_streaming(
     data_paths: List[str], 
     validation_ratio: float,
     subset_ratio: float = 1.0,
-    cache_dir: Optional[Path] = None,
 ) -> Tuple[Dataset, Dataset]:
     """
     Load the dataset from the specified data source in streaming mode.
@@ -188,74 +233,53 @@ def create_datasets_streaming(
     """
     if not data_paths:
         raise ValueError("No data_paths provided")
-    if not cache_dir:
-        cache_dir = Path(data_paths[0]).parent / "cache"
-    elif not Path(cache_dir).is_dir():
-        os.makedirs(cache_dir, exist_ok=True)
-        cache_dir = str(cache_dir)
     if subset_ratio < 1.0:
         raise ValueError("subset_ratio < 1.0 not yet supported for streaming datasets")
         # TODO: implement subset_ratio for streaming datasets
-
-    train_datasets = []
-    validation_datasets = []
-
-    # DEBUGGING
-    # files = [file for file in files if "shard_022.parquet" in str(file)or "shard_023.parquet" in str(file)]
 
     random.shuffle(data_paths)
     validation_threshold = math.ceil(len(data_paths) * validation_ratio) if validation_ratio > 0 else 0
     training_files = data_paths[validation_threshold:]
     validation_files = data_paths[:validation_threshold] if validation_ratio > 0 else []
+    printmaster(f"Total number of shards: {len(data_paths)}")
+    printmaster(f"Number of training shards: {len(training_files)}")
+    printmaster(f"Number of validation shards: {len(validation_files)}")
     training_shards = [str(file) for i, file in enumerate(training_files) if (i % WORLD_SIZE) == GLOBAL_RANK]
-    validation_shards = [str(file) for file in validation_files]
-    printmaster(f"Using cache directory at {cache_dir}")
-    printgpu(f"training_shards: {json.dumps(training_shards, indent=2)}")
-    printgpu(f"validation_shards: {json.dumps(validation_shards, indent=2)}")
+    if len(validation_files) % WORLD_SIZE == 0:
+        validation_shards = [str(file) for i, file in enumerate(validation_files) if (i % WORLD_SIZE) == GLOBAL_RANK]
+    else:
+        printmaster(f"Warning: number of validation shards {len(validation_files)} is not divisible by WORLD_SIZE {WORLD_SIZE}, so every GPU is getting all validation shards, which is not ideal.")
+        validation_shards = [str(file) for file in validation_files]
+    printgpu(f"training_shards ({len(training_shards)}): {json.dumps(training_shards, indent=2)}")
+    printgpu(f"validation_shards ({len(validation_shards)}): {json.dumps(validation_shards, indent=2)}")
 
     if not training_shards:
         raise FileNotFoundError(f"No shards found on rank {GLOBAL_RANK}")
+
+    validate_shard_distribution(training_shards, "Training")
+    validate_sample_distribution(training_shards, "Training")
+    validate_shard_distribution(validation_shards, "Validation")
+    validate_sample_distribution(validation_shards, "Validation")
 
     train_dataset = load_dataset(
         "parquet",
         data_files=training_shards,
         split="train",  # specify train to load all the data into a dataset directly and not a dataset dict
-        cache_dir=cache_dir,
+        streaming=True,
     )
-    printgpu(f"Loaded training dataset with {len(train_dataset)} samples on rank {GLOBAL_RANK}")
-    train_dataset = train_dataset.to_iterable_dataset()
+    train_dataset = train_dataset.with_format("torch")
 
     if len(validation_files) > 0:
         validation_dataset = load_dataset(
             "parquet",
             data_files=validation_shards,
             split="train",  # specify train to load all the data into a dataset directly and not a dataset dict
-            cache_dir=cache_dir,
+            streaming=True,
         )
-        printgpu(f"Loaded validation dataset with {len(validation_dataset)} samples on rank {GLOBAL_RANK}")
-        validation_dataset = validation_dataset.to_iterable_dataset()
+        validation_dataset = validation_dataset.with_format("torch")
     else:
         validation_dataset = None
         printmaster(f"No validation shards found because validation_ratio <= 0")
-
-    train_datasets.append(train_dataset)
-    if validation_dataset:
-        validation_datasets.append(validation_dataset)
-
-    printmaster(f"Number of training datasets to concatenate: {len(train_datasets)}")
-    train_dataset = concatenate_datasets(train_datasets) if len(train_datasets) > 1 else train_datasets[0]
-    train_dataset = train_dataset.with_format("torch")
-    printmaster(f"total train_dataset.n_shards: {train_dataset.n_shards}")
-
-
-    if len(validation_datasets) > 0:
-        printmaster(f"Number of validation datasets to concatenate: {len(validation_datasets)}")
-        validation_dataset = concatenate_datasets(validation_datasets) if len(validation_datasets) > 1 else validation_datasets[0]
-        validation_dataset = validation_dataset.with_format("torch") if validation_dataset else None
-        printmaster(f"total validation_dataset.n_shards: {validation_dataset.n_shards}")
-    else:
-        validation_dataset = None
-        printmaster(f"No validation datasets found because validation_ratio <= 0")
 
     return train_dataset, validation_dataset
 
@@ -277,7 +301,7 @@ def create_datasets(data_paths: List[Path], cache_dir: Optional[Path] = None, va
     datasets = []
     example_count = 0
     for file in data_paths:
-        if not file.exists():
+        if not Path(file).exists():
             raise FileNotFoundError(f"File not found: {file}")
 
         raw_dataset = load_dataset(
@@ -357,6 +381,7 @@ def create_dataloaders(train_dataset: Dataset, validation_dataset: Dataset, batc
                 collate_fn=collator,
                 prefetch_factor=2
             )
+            printmaster(f"Validation loader prefetch factor: {validation_loader.prefetch_factor}, num_workers: {validation_loader.num_workers}")
         else:
             validation_loader = None
     else: 
@@ -414,7 +439,7 @@ def get_dataloaders(
         printmaster(f"Final training dataset length: {len(train_dataset)}")
         printmaster(f"Final validation dataset length: {len(validation_dataset)}")
     else:
-        train_dataset, validation_dataset = create_datasets_streaming(data_paths, cache_dir=cache_dir, subset_ratio=subset_ratio, validation_ratio=validation_ratio)
+        train_dataset, validation_dataset = create_datasets_streaming(data_paths, subset_ratio=subset_ratio, validation_ratio=validation_ratio)
     collator = create_collator(
         vocab=vocab,
         max_seq_len=max_seq_len,
@@ -433,7 +458,7 @@ def get_dataloaders(
         printgpu(f"Train loader initialized with {len(train_loader)} batches")
         printgpu(f"Validation loader initialized with {len(validation_loader)} batches")
     else:
-        printmaster("Train and Validation loaders in streaming mode - exact count not available")
+        printmaster(f"Train and Validation loaders in streaming mode - approximate number of batches per epoch: {get_total_batch_count_per_GPU(data_paths, batch_size)}")
     return train_loader, validation_loader
 
 
@@ -501,16 +526,16 @@ def get_scheduler(
         scheduler_interval: int,
         scheduler_factor: float,
         streaming: bool,
-        tissues: List[str] = None,
+        data_paths: List[str] = None,
     ) -> transformers.get_scheduler:
     """
     Get the learning rate scheduler.
     """
     if warmup_ratio_or_steps > 0:
         if streaming:
-            if tissues is None:
-                raise ValueError("tissues must be provided for streaming datasets")
-            total_num_batches = get_total_batch_count_per_GPU(tissues, train_loader.batch_size) * epochs
+            if data_paths is None:
+                raise ValueError("data_paths must be provided for streaming datasets")
+            total_num_batches = get_total_batch_count_per_GPU(data_paths, train_loader.batch_size) * epochs
         else:
             total_num_batches = len(train_loader) * epochs
         warmup_steps = (
@@ -550,6 +575,7 @@ def pretrain_streaming(
         fp16_enabled: bool,
         scaler: torch.cuda.amp.GradScaler,
         grad_accu_steps: int = 1,
+        n_total_batches: int = None,
     ) -> None:
     """
     Train the model for the specified number of epochs.
@@ -651,11 +677,21 @@ def pretrain_streaming(
                 delta_time_elapsed = time.time() - delta_training_time
                 delta_training_time = time.time()
                 printlogging(
-                    f"Epoch {epoch+1:2d} | Iter {i+1:5d} | "
+                    f"Epoch {epoch+1:2d}/{num_epochs:2d} | Iter {i+1:5d}/{n_total_batches:5d} | "
                     f"Loss: {total_loss.item():12.4f} | "
                     f"Total Time: {str(timedelta(seconds=int(total_time_elapsed)))} | "
                     f"Delta Time: {str(timedelta(seconds=int(delta_time_elapsed)))}",
                     level="training"
+                )
+            if SEPARATE_LOG_FILES:            
+                total_time_elapsed = time.time() - total_training_time
+                delta_time_elapsed = time.time() - delta_training_time
+                delta_training_time = time.time()
+                printgpu(
+                    f"Epoch {epoch+1:2d}/{num_epochs:2d} | Iter {i+1:5d}/{n_total_batches:5d} | "
+                    f"Loss: {total_loss.item():12.4f} | "
+                    f"Total Time: {str(timedelta(seconds=int(total_time_elapsed)))} | "
+                    f"Delta Time: {str(timedelta(seconds=int(delta_time_elapsed)))}"
                 )
 
             if ((global_iter % save_interval == 0 and global_iter > 0) or is_last_batch) and validation_loader is not None:
@@ -686,9 +722,15 @@ def pretrain_streaming(
                     f"Saved: {saved}",
                     level="validation"
                 )
+                if SEPARATE_LOG_FILES:
+                    printgpu(
+                        f"Epoch {epoch+1:2d}/{num_epochs:2d} | Iter {i+1:5d} | "
+                        f"Loss: {val_mse:12.4f} | "
+                        f"Saved: {saved}"
+                    )
             global_iter += 1
+            dist.barrier()
 
-        printgpu(f"Finished epoch {epoch+1}/{num_epochs} and waiting for other GPUs to catch up...")
         dist.barrier()
     writer.close()
     printmaster("Training complete.")
@@ -949,7 +991,7 @@ def initialize_slurm_variables():
     GLOBAL_RANK   = int(os.environ["SLURM_PROCID"])
     CPUS_PER_TASK = int(os.environ["SLURM_CPUS_PER_TASK"])
     LOCAL_RANK = GLOBAL_RANK - GPUS_PER_NODE * (GLOBAL_RANK // GPUS_PER_NODE)
-    printgpu(f"CPUS_PER_TASK: {CPUS_PER_TASK}")
+    # printgpu(f"CPUS_PER_TASK: {CPUS_PER_TASK}")
     torch.cuda.set_device(LOCAL_RANK)
 
 
@@ -960,6 +1002,8 @@ def initialize_utility_variables(args: argparse.Namespace):
     global SAVE_DIR, USE_GENERATIVE_TRAINING, SPECIAL_TOKENS, SEED
     global USE_CLS, USE_CCE, MVC
     global TISSUES
+    global SEPARATE_LOG_FILES
+    SEPARATE_LOG_FILES = args.separate_gpu_log_files
     SAVE_DIR = Path(args.save_dir)
     os.makedirs(SAVE_DIR, exist_ok=True)
     USE_GENERATIVE_TRAINING = True if args.training_tasks in ["gen", "both"] else False
@@ -1069,7 +1113,7 @@ def main():
             scheduler_interval=args.scheduler_interval,
             scheduler_factor=args.scheduler_factor,
             streaming=args.streaming,
-            tissues=args.tissues if args.streaming else None,
+            data_paths=args.datapaths if args.streaming else None,
         )
         dist.barrier()
         time.sleep(2)
@@ -1092,8 +1136,8 @@ def main():
                 fp16_enabled=args.fp16,
                 scaler=torch.cuda.amp.GradScaler(enabled=args.fp16),
                 grad_accu_steps=args.grad_accu_steps,
+                n_total_batches=get_total_batch_count_per_GPU(args.datapaths, args.batch_size),
             )
-            printgpu("Returned to main")
         else:
             pretrain(
                 model=ddp_model,
