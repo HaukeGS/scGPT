@@ -1,3 +1,4 @@
+import json
 import argparse
 import warnings
 from pathlib import Path
@@ -48,10 +49,12 @@ def add_arguments(parser: argparse.ArgumentParser):
         help="The directory to save the trained model and the results.",
     )
     parser.add_argument(
-        "--load-model",
+        "--checkpoint-dir",
         type=str,
         default=None,
-        help="The directory containing the model and configs to load and continue training.",
+        help="The directory containing the model and configs to load and continue training. "
+        "The following files are expected in the directory: checkpoint-{epoch}-{step}.pt, vocab.json, args.json. "
+        "The last checkpoint will automatically be selected and loaded.",
     )
 
     # settings for data
@@ -302,6 +305,34 @@ def add_arguments(parser: argparse.ArgumentParser):
         help="Whether to create separate log files for each GPU in distributed "
         "training. Default is False.",
     )
+
+
+def _parse_args() -> argparse.Namespace:
+    parser = get_parser()
+    args = parser.parse_args()
+    if args.checkpoint_dir is not None:
+        checkpoint_dir = args.checkpoint_dir
+        save_dir = args.save_dir
+        args = load_args_from_model_dir(checkpoint_dir)
+        args.checkpoint_dir = checkpoint_dir
+        args.save_dir = save_dir
+    return args
+
+
+def load_args_from_model_dir(model_dir: str) -> argparse.Namespace:
+    args_path = Path(model_dir) / "args.json"
+    if not args_path.is_file():
+        raise FileNotFoundError(f"Could not find args.json in {model_dir}.")
+
+    with open(args_path, "r") as f:
+        args_dict = json.load(f)
+
+    args = argparse.Namespace()
+    for key, value in args_dict.items():
+        setattr(args, key, value)
+
+    return args
+
 
 def validate_args(args: argparse.Namespace):
     if args.tissues is not None and args.data_tissue_path is None:

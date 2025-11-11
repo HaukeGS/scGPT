@@ -10,6 +10,7 @@ import argparse
 import json
 import time
 import random
+import re
 from socket import gethostname
 from datetime import timedelta
 from pathlib import Path
@@ -19,10 +20,11 @@ import pyarrow.parquet as pq
 # torch relevant imports
 import torch
 import transformers
-from torch import nn
+from torch import mode, nn
 from torch.utils.tensorboard import SummaryWriter
-from torch.utils.data import DataLoader, BatchSampler, RandomSampler, SequentialSampler
-from datasets import Dataset, load_dataset, concatenate_datasets, interleave_datasets, IterableDataset
+from torch.utils.data import DataLoader
+# from torchdata.stateful_dataloader import StatefulDataLoader
+from datasets import Dataset, load_dataset, concatenate_datasets
 
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
@@ -109,7 +111,7 @@ def dump_vocab(vocab: GeneVocab) -> None:
                 {token: index for token, index in vocab.get_stoi().items()},
                 f,
                 indent=2,
-        )
+            )
             
 
 def dump_debug(output: str) -> None:
@@ -119,18 +121,6 @@ def dump_debug(output: str) -> None:
     if is_master_gpu():
         with open(SAVE_DIR / "debug.txt", "a") as f:
             f.write(output + "\n")
-
-
-def get_tissue_sample_count(tissue: str) -> int:
-    """
-    Get the number of samples in the specified tissue.
-    """
-    with open("/home/hauke.schuele/scGPT_distributed/total_dataset_sample_counts.json", "r") as f:
-        example_numbers = json.load(f)
-        if tissue not in example_numbers:
-            raise KeyError(f"Tissue '{tissue}' not found in total_dataset_sample_counts.json")
-        else:
-            return example_numbers[tissue]
 
 
 def get_total_sample_counts(data_paths: List[str]) -> int:
@@ -156,7 +146,7 @@ def get_total_batch_count_per_GPU(data_paths: List[str], batch_size: int) -> int
     Get the total number of batches in the dataset per GPU.
     """
     total_count = get_total_sample_counts(data_paths)
-    return total_count // (batch_size * WORLD_SIZE)
+    return (total_count // (batch_size * WORLD_SIZE)) - 1 # To account for drop_last=True, don't @ me, I know that // already accounts for that
 
 
 def validate_data_paths(data_paths: List[Path]) -> None:
@@ -187,7 +177,7 @@ def validate_shard_distribution(shards: List[str], shard_type: str = "") -> None
     gathered_shards = [torch.zeros_like(count) for _ in range(WORLD_SIZE)]
     dist.all_gather(gathered_shards, count)
     if not all(count.item() == gathered_shards[0].item() for count in gathered_shards):
-        raise ValueError(f"Shards are not evenly distributed across GPUs: {gathered_shards}")
+        raise ValueError(f"{shard_type} Shards are not evenly distributed across GPUs: {gathered_shards}")
     
     
 def validate_sample_distribution(shards: List[str], sample_type: str = "") -> None:
@@ -200,15 +190,11 @@ def validate_sample_distribution(shards: List[str], sample_type: str = "") -> No
     gathered_sizes = [torch.zeros_like(total_size) for _ in range(WORLD_SIZE)]
     dist.all_gather(gathered_sizes, total_size)
     if not all(size.item() == gathered_sizes[0].item() for size in gathered_sizes):
-        raise ValueError(f"Samples are not evenly distributed across GPUs: {gathered_sizes}")
+        raise ValueError(f"{sample_type} Samples are not evenly distributed across GPUs: {gathered_sizes}")
 
 
 
-def create_datasets_streaming(
-    data_paths: List[str], 
-    validation_ratio: float,
-    subset_ratio: float = 1.0,
-) -> Tuple[Dataset, Dataset]:
+def create_datasets(args: argparse.Namespace) -> Tuple[Dataset, Dataset]:
     """
     Load the dataset from the specified data source in streaming mode.
     data_source is a list of .parquet files. 
@@ -231,17 +217,15 @@ def create_datasets_streaming(
         validation_dataset: Dataset
             The interleaved validation dataset.
     """
-    if not data_paths:
+    if not args.data_paths:
         raise ValueError("No data_paths provided")
-    if subset_ratio < 1.0:
+    if args.subset_ratio < 1.0:
         raise ValueError("subset_ratio < 1.0 not yet supported for streaming datasets")
         # TODO: implement subset_ratio for streaming datasets
 
-    random.shuffle(data_paths)
-    validation_threshold = math.ceil(len(data_paths) * validation_ratio) if validation_ratio > 0 else 0
-    training_files = data_paths[validation_threshold:]
-    validation_files = data_paths[:validation_threshold] if validation_ratio > 0 else []
-    printmaster(f"Total number of shards: {len(data_paths)}")
+    training_files = args.train_paths
+    validation_files = args.valid_paths
+    printmaster(f"Total number of shards: {len(args.data_paths)}")
     printmaster(f"Number of training shards: {len(training_files)}")
     printmaster(f"Number of validation shards: {len(validation_files)}")
     training_shards = [str(file) for i, file in enumerate(training_files) if (i % WORLD_SIZE) == GLOBAL_RANK]
@@ -284,49 +268,6 @@ def create_datasets_streaming(
     return train_dataset, validation_dataset
 
 
-def create_datasets(data_paths: List[Path], cache_dir: Optional[Path] = None, validation_ratio: float = 0.0, subset_ratio: float = 1.0) -> Tuple[Dataset, Dataset]:
-    """
-    Load the dataset from the specified data source.
-    data_source can contain multiple directories. See argparser.py for more details
-    This assumes one or more directories with a preprocessed cls_prefix_data.parquet file. 
-    Returns the concatenated datasets from all directories.
-    """
-    if not data_paths:
-        raise ValueError("No data paths provided")
-    if not cache_dir:
-        cache_dir = Path(data_paths[0]).parent / "cache"
-    elif not Path(cache_dir).is_dir():
-        os.makedirs(cache_dir, exist_ok=True)
-        cache_dir = str(cache_dir)
-    datasets = []
-    example_count = 0
-    for file in data_paths:
-        if not Path(file).exists():
-            raise FileNotFoundError(f"File not found: {file}")
-
-        raw_dataset = load_dataset(
-            "parquet",
-            data_files=str(file),
-            split="train",  # specify train to load all the data into a dataset directly and not a dataset dict
-            cache_dir=cache_dir,
-        )
-        if subset_ratio < 1.0:
-            subset_size = int(len(raw_dataset) * subset_ratio)
-            raw_dataset = raw_dataset.shuffle(seed=SEED).select(range(subset_size))
-
-        datasets.append(raw_dataset)
-        printmaster(f"Loaded {len(raw_dataset)} examples from {file}" + 
-                    (f" because of subset_ratio={subset_ratio}" if subset_ratio < 1.0 else ""))
-        example_count += len(raw_dataset)
-    printmaster(f"Total examples across all datasets: {example_count}")
-    if subset_ratio < 1.0:
-        printmaster(f"Note: subset_ratio={subset_ratio} applied to each dataset")
-    merged_dataset = concatenate_datasets(datasets)
-    merged_dataset = merged_dataset.with_format("torch")
-    train_dataset, validation_dataset = merged_dataset.train_test_split(test_size=validation_ratio, shuffle=True, seed=SEED).values()
-    return train_dataset, validation_dataset
-
-
 def create_collator(
         vocab: GeneVocab, 
         max_seq_len: int, 
@@ -356,153 +297,85 @@ def create_collator(
     return collator
 
 
-def create_dataloaders(train_dataset: Dataset, validation_dataset: Dataset, batch_size: int, collator: scg.DataCollator, streaming: bool = False) -> Tuple[DataLoader, DataLoader]:
+def create_dataloaders(train_dataset: Dataset, validation_dataset: Dataset, batch_size: int, collator: scg.DataCollator) -> Tuple[DataLoader, DataLoader]:
     """
     Get the dataloaders for training and validation datasets.
     Uses DistributedSampler for the training loader and uses the full validation dataset for the validation loader.
     """
-    if streaming:
-        train_loader = DataLoader(
-            train_dataset,
-            batch_size=batch_size,
-            num_workers=min(CPUS_PER_TASK, train_dataset.n_shards),
-            pin_memory=True,
-            drop_last=True,
-            collate_fn=collator,
-            prefetch_factor=2
-        )
-        if validation_dataset:
-            validation_loader = DataLoader(
-                validation_dataset,
-                batch_size=batch_size,
-                num_workers=min(CPUS_PER_TASK, validation_dataset.n_shards),
-                pin_memory=True,
-                drop_last=False,
-                collate_fn=collator,
-                prefetch_factor=2
-            )
-            printmaster(f"Validation loader prefetch factor: {validation_loader.prefetch_factor}, num_workers: {validation_loader.num_workers}")
-        else:
-            validation_loader = None
-    else: 
-        if dist.is_initialized():
-            train_sampler = DistributedSampler(train_dataset, num_replicas=WORLD_SIZE, rank=GLOBAL_RANK, shuffle=True)
-            validation_sampler = DistributedSampler(validation_dataset, num_replicas=WORLD_SIZE, rank=GLOBAL_RANK, shuffle=False)
-        else:
-            raise ValueError("Distributed not initialized")
-
-        train_loader = DataLoader(
-            train_dataset,
-            batch_size=batch_size,
-            sampler=train_sampler,
-            num_workers=CPUS_PER_TASK,
-            pin_memory=True,
-            drop_last=True,
-            collate_fn=collator,
-            prefetch_factor=2
-        )
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=batch_size,
+        num_workers=min(CPUS_PER_TASK, train_dataset.n_shards),
+        pin_memory=True,
+        drop_last=True,
+        collate_fn=collator,
+        prefetch_factor=2
+    )
+    if validation_dataset:
         validation_loader = DataLoader(
             validation_dataset,
             batch_size=batch_size,
-            sampler=validation_sampler,
-            num_workers=CPUS_PER_TASK,
+            num_workers=min(CPUS_PER_TASK, validation_dataset.n_shards),
             pin_memory=True,
             drop_last=False,
             collate_fn=collator,
             prefetch_factor=2
         )
+        printmaster(f"Validation loader prefetch factor: {validation_loader.prefetch_factor}, num_workers: {validation_loader.num_workers}")
+    else:
+        validation_loader = None
     return train_loader, validation_loader
 
 
-def get_dataloaders(
-        data_paths: List[Path], 
-        validation_ratio: float, 
-        vocab: GeneVocab,
-        max_seq_len: int, 
-        pad_token: str, 
-        pad_value: int,
-        input_style: str,
-        mask_ratio: Union[float, List[float]],
-        mask_value: float,
-        trunc_by_sample: bool,
-        training_tasks: str,
-        batch_size: int,
-        subset_ratio: float = 1.0,
-        streaming: bool = False,
-        cache_dir: Optional[Path] = None,
-    ) -> Tuple[DataLoader, DataLoader]:
+def get_dataloaders(args: argparse.Namespace, vocab: GeneVocab) -> Tuple[DataLoader, DataLoader]:
     """
     Get the dataloaders for training and validation datasets.
     """
-    if not streaming:
-        train_dataset, validation_dataset = create_datasets(data_paths, cache_dir=cache_dir, validation_ratio=validation_ratio, subset_ratio=subset_ratio)
-        printmaster(f"Final training dataset length: {len(train_dataset)}")
-        printmaster(f"Final validation dataset length: {len(validation_dataset)}")
-    else:
-        train_dataset, validation_dataset = create_datasets_streaming(data_paths, subset_ratio=subset_ratio, validation_ratio=validation_ratio)
+    train_dataset, validation_dataset = create_datasets(args=args)
     collator = create_collator(
         vocab=vocab,
-        max_seq_len=max_seq_len,
-        pad_token=pad_token,
-        pad_value=pad_value,
-        input_style=input_style,
-        mask_ratio=mask_ratio,
-        mask_value=mask_value,
-        trunc_by_sample=trunc_by_sample,
-        training_tasks=training_tasks,
+        max_seq_len=args.max_seq_len,
+        pad_token=args.pad_token,
+        pad_value=args.pad_value,
+        input_style=args.input_style,
+        mask_ratio=args.mask_ratio,
+        mask_value=args.mask_value,
+        trunc_by_sample=args.trunc_by_sample,
+        training_tasks=args.training_tasks,
     )
-    train_loader, validation_loader = create_dataloaders(train_dataset, validation_dataset, batch_size, collator, streaming=streaming)
+    train_loader, validation_loader = create_dataloaders(train_dataset, validation_dataset, args.batch_size, collator)
     dist.barrier()
     time.sleep(2)
-    if not streaming:
-        printgpu(f"Train loader initialized with {len(train_loader)} batches")
-        printgpu(f"Validation loader initialized with {len(validation_loader)} batches")
-    else:
-        printmaster(f"Train and Validation loaders in streaming mode - approximate number of batches per epoch: {get_total_batch_count_per_GPU(data_paths, batch_size)}")
     return train_loader, validation_loader
 
 
 
 # %% Model initialization
 
-def get_model(
-        embedding_size: int,
-        number_of_heads: int,
-        hidden_size: int,
-        number_of_layers: int,
-        number_of_layers_cls: int,
-        dropout: float,
-        pad_token: str,
-        pad_value: int,
-        input_emb_style: str,
-        number_of_input_bins: int,
-        use_generative_training: bool,
-        use_fast_transformer: bool,
-        vocab: GeneVocab
-    ) -> DDP:
+def get_model(args: argparse.Namespace, vocab: GeneVocab) -> DDP:
     """
     Initialize the model and wrap it in DistributedDataParallel.
     """
     ntokens = len(vocab)  # size of vocabulary
     model = TransformerModel(
         ntokens,
-        d_model=embedding_size,
-        nhead=number_of_heads,
-        d_hid=hidden_size,
-        nlayers=number_of_layers,
-        nlayers_cls=number_of_layers_cls,
+        d_model=args.embsize,
+        nhead=args.nheads,
+        d_hid=args.d_hid,
+        nlayers=args.nlayers,
+        nlayers_cls=args.n_layers_cls,
         n_cls=1, # num_types if USE_CLS else 1,
         vocab=vocab,
-        dropout=dropout,
-        pad_token=pad_token,
-        pad_value=pad_value,
+        dropout=args.dropout,
+        pad_token=args.pad_token,
+        pad_value=args.pad_value,
         do_mvc=MVC,
         do_dab=False,
         use_batch_labels=False,  # TODO: try using batch labels, may help MVC
-        input_emb_style=input_emb_style,
-        n_input_bins=number_of_input_bins,
-        use_generative_training=use_generative_training,
-        use_fast_transformer=use_fast_transformer,
+        input_emb_style=args.input_emb_style,
+        n_input_bins=args.n_input_bins,
+        use_generative_training=USE_GENERATIVE_TRAINING,
+        use_fast_transformer=args.fast_transformer,
         fast_transformer_backend="flash",
     ).to(LOCAL_RANK)
     ddp_model = DDP(model, device_ids=[LOCAL_RANK])
@@ -510,38 +383,18 @@ def get_model(
     return ddp_model
 
 
-def load_model_checkpoint(model: DDP, checkpoint_path: Path) -> None:
-    """
-    Load the model checkpoint from the specified path.
-    """
-    # TODO: implement loading of model checkpoint
-    pass
-
-
-def get_scheduler(
-        optimizer: torch.optim.Optimizer, 
-        warmup_ratio_or_steps: float, 
-        train_loader: DataLoader,
-        epochs: int,
-        scheduler_interval: int,
-        scheduler_factor: float,
-        streaming: bool,
-        data_paths: List[str] = None,
-    ) -> transformers.get_scheduler:
+def get_scheduler(args: argparse.Namespace, train_loader: DataLoader, optimizer: torch.optim.Optimizer) -> transformers.get_scheduler:
     """
     Get the learning rate scheduler.
     """
-    if warmup_ratio_or_steps > 0:
-        if streaming:
-            if data_paths is None:
-                raise ValueError("data_paths must be provided for streaming datasets")
-            total_num_batches = get_total_batch_count_per_GPU(data_paths, train_loader.batch_size) * epochs
-        else:
-            total_num_batches = len(train_loader) * epochs
+    if args.warmup_ratio_or_steps > 0:
+        if args.train_paths is None:
+            raise ValueError("data_paths must be provided for streaming datasets")
+        total_num_batches = get_total_batch_count_per_GPU(args.train_paths, train_loader.batch_size) * args.epochs
         warmup_steps = (
-            int(total_num_batches * warmup_ratio_or_steps)
-            if warmup_ratio_or_steps < 1
-            else int(warmup_ratio_or_steps)
+            int(total_num_batches * args.warmup_ratio_or_steps)
+            if args.warmup_ratio_or_steps < 1
+            else int(args.warmup_ratio_or_steps)
         )
         scheduler = transformers.get_cosine_schedule_with_warmup(
             optimizer,
@@ -552,60 +405,116 @@ def get_scheduler(
         printmaster(f"Using cosine scheduler with {warmup_steps} warmup steps")
     else:
         scheduler = torch.optim.lr_scheduler.StepLR(
-            optimizer, scheduler_interval, gamma=scheduler_factor
+            optimizer, args.scheduler_interval, gamma=args.scheduler_factor
         )
     return scheduler
 
 
+def get_latest_checkpoint(checkpoint_dir: str) -> str:
+    """
+    Get the latest training state file.
+    """
+    state_files = list(Path(checkpoint_dir).glob("checkpoint-*.pt"))
+    if not state_files:
+        raise FileNotFoundError(f"No training state files found in {checkpoint_dir}.")
+    regex = r'checkpoint-(?P<epoch>\d+)-(?P<batch_idx>\d+)\.pt'
+    latest_epoch = -1
+    latest_batch_idx = -1
+    latest_file = None
+    for file in state_files:
+        m = re.search(regex, file.name)
+        if m:
+            epoch = int(m.group('epoch'))
+            batch_idx = int(m.group('batch_idx'))
+            if (epoch > latest_epoch) or (epoch == latest_epoch and batch_idx > latest_batch_idx):
+                latest_epoch = epoch
+                latest_batch_idx = batch_idx
+                latest_file = file
+    return str(latest_file)
+
+
+def load_checkpoint(
+        checkpoint_dir: str,
+        model: DDP,
+        device: torch.device,
+        optimizer: torch.optim.Optimizer,
+        scaler: torch.cuda.amp.GradScaler,
+        scheduler: transformers.get_scheduler,
+) -> None:
+    """
+    Load the training state from the specified directory.
+    """
+    state_path = get_latest_checkpoint(checkpoint_dir)
+    if not Path(state_path).is_file():
+        raise FileNotFoundError(f"Could not find {state_path} in {checkpoint_dir}.")
+    printmaster(f"Loading training state from {state_path}...")
+    state_dict = torch.load(state_path, map_location=device)
+    model.load_state_dict(state_dict["model_state"])
+    random.setstate(state_dict["py_random_state"])
+    torch.set_rng_state(state_dict["torch_random_state"].to("cpu"))
+    torch.cuda.set_rng_state_all([cuda_random_state.to("cpu") for cuda_random_state in state_dict["cuda_random_state"]])
+    optimizer.load_state_dict(state_dict["optimizer_state"])
+    scaler.load_state_dict(state_dict["scaler_state"])
+    scheduler.load_state_dict(state_dict["scheduler_state"])
+    printmaster(f"Finished loading training state from {state_path}")
+    return state_dict["global_iter"], state_dict["epoch"], state_dict["batch_idx"]
+
+
 # %% Training and evaluation
-def pretrain_streaming(
+def pretrain(
+        args: argparse.Namespace,
         model: DDP,
         train_loader: DataLoader,
         validation_loader: DataLoader,
         criterion: nn.Module,
         optimizer: torch.optim.Optimizer,
         scheduler: transformers.get_scheduler,
-        num_epochs: int,
-        log_interval: int,
-        save_interval: int,
         device: torch.device,
         vocab: GeneVocab,
-        pad_token: str,
-        mask_value: float,
-        fp16_enabled: bool,
         scaler: torch.cuda.amp.GradScaler,
-        grad_accu_steps: int = 1,
-        n_total_batches: int = None,
     ) -> None:
     """
     Train the model for the specified number of epochs.
     """
     best_val_mse = float("inf")
     best_val_mre = float("inf")
-    global_iter = 0
     writer = SummaryWriter(log_dir=SAVE_DIR / "tensorboard")
     total_training_time = time.time()
     delta_training_time = time.time()
     is_last_batch = False
-    for epoch in range(num_epochs):
+    n_total_batches=get_total_batch_count_per_GPU(args.train_paths, args.batch_size)
+    global_iter, epoch_offset, batch_offset = 0, 0, 0
+    if args.checkpoint_dir is not None:
+        global_iter, epoch_offset, batch_offset = load_checkpoint(args.checkpoint_dir, model, device, optimizer, scaler, scheduler)
+    for epoch in range(args.epochs):
         model.train()
-        printmaster(f"Starting epoch {epoch+1}/{num_epochs}")
+        if epoch < epoch_offset:
+            printmaster(f"Skipping epoch {epoch+1} due to continue training from epoch {epoch_offset+1}")
+            continue
+        printmaster(f"Starting epoch {epoch+1}/{args.epochs}")
 
-        # train_loader = StreamingDataLoaderWrapper(train_loader)
+        running_loss_mse = 0.0
+        running_loss_mvc = 0.0
+        running_loss_gen = 0.0
+        running_loss_total = 0.0
+
         for i, data_dict in enumerate(train_loader):
-        # for data_dict, i, is_last_batch in train_loader:
+            if i < batch_offset and epoch == epoch_offset:
+                if is_master_gpu() and (i + 1) % args.log_interval == 0:
+                    printlogging(f"Skipping batch {i+1} due to continue training from batch {batch_offset}", level="Training")
+                continue
 
             pcpt_gene = data_dict["pcpt_gene"].to(device)
             pcpt_expr = data_dict["pcpt_expr"].to(device)
             gen_gene = data_dict["gen_gene"].to(device)
             gen_expr_target = data_dict["gen_expr_target"].to(device)
-            pcpt_key_padding_mask = pcpt_gene.eq(vocab[pad_token])
-            gen_key_padding_mask = gen_gene.eq(vocab[pad_token])
+            pcpt_key_padding_mask = pcpt_gene.eq(vocab[args.pad_token])
+            gen_key_padding_mask = gen_gene.eq(vocab[args.pad_token])
 
             if i == 0:
                 [printmaster(f"data_dict key: {k}, shape: {v.shape}") for k, v in data_dict.items()]
             
-            with torch.cuda.amp.autocast(enabled=fp16_enabled):
+            with torch.cuda.amp.autocast(enabled=args.fp16):
                 output_dict = model(
                     pcpt_gene,
                     pcpt_expr,
@@ -649,8 +558,8 @@ def pretrain_streaming(
 
                 total_loss = loss_mse + loss_mvc + loss_gen
 
-            if grad_accu_steps > 1:
-                total_loss = total_loss / grad_accu_steps
+            if args.grad_accu_steps > 1:
+                total_loss = total_loss / args.grad_accu_steps
             optimizer.zero_grad()
             scaler.scale(total_loss).backward()
             scaler.unscale_(optimizer)
@@ -660,49 +569,64 @@ def pretrain_streaming(
             )  # gradient clipping
             scaler.step(optimizer)
             scaler.update()
-            if grad_accu_steps > 1:
-                if (i + 1) % grad_accu_steps == 0 or is_last_batch:
+            if args.grad_accu_steps > 1:
+                if (i + 1) % args.grad_accu_steps == 0 or is_last_batch:
                     scheduler.step()
             else:
                 scheduler.step()
 
-            if is_master_gpu() and global_iter % log_interval == 0 and global_iter > 0:
-                writer.add_scalar("loss/mse", loss_mse, global_iter)
-                writer.add_scalar("loss/mvc", loss_mvc, global_iter)
-                writer.add_scalar("loss/gen", loss_gen, global_iter)
-                writer.add_scalar("loss/total", total_loss, global_iter)
-                writer.add_scalar("lr", scheduler.get_last_lr()[0], global_iter)
-            if is_master_gpu() and (i + 1) % log_interval == 0 and (i + 1) > 0:
-                total_time_elapsed = time.time() - total_training_time
-                delta_time_elapsed = time.time() - delta_training_time
-                delta_training_time = time.time()
-                printlogging(
-                    f"Epoch {epoch+1:2d}/{num_epochs:2d} | Iter {i+1:5d}/{n_total_batches:5d} | "
-                    f"Loss: {total_loss.item():12.4f} | "
-                    f"Total Time: {str(timedelta(seconds=int(total_time_elapsed)))} | "
-                    f"Delta Time: {str(timedelta(seconds=int(delta_time_elapsed)))}",
-                    level="training"
-                )
-            if SEPARATE_LOG_FILES:            
-                total_time_elapsed = time.time() - total_training_time
-                delta_time_elapsed = time.time() - delta_training_time
-                delta_training_time = time.time()
-                printgpu(
-                    f"Epoch {epoch+1:2d}/{num_epochs:2d} | Iter {i+1:5d}/{n_total_batches:5d} | "
-                    f"Loss: {total_loss.item():12.4f} | "
-                    f"Total Time: {str(timedelta(seconds=int(total_time_elapsed)))} | "
-                    f"Delta Time: {str(timedelta(seconds=int(delta_time_elapsed)))}"
-                )
 
-            if ((global_iter % save_interval == 0 and global_iter > 0) or is_last_batch) and validation_loader is not None:
+            running_loss_mse += loss_mse.item()
+            running_loss_mvc += loss_mvc.item()
+            running_loss_gen += loss_gen.item()
+            running_loss_total += total_loss.item()
+            # if is_master_gpu() and ((global_iter % args.log_interval == 0 and global_iter > 0) or (i+1) >= n_total_batches):
+            #     writer.add_scalar("loss/mse", running_loss_mse / args.log_interval, global_iter)
+            #     writer.add_scalar("loss/mvc", running_loss_mvc / args.log_interval, global_iter)
+            #     writer.add_scalar("loss/gen", running_loss_gen / args.log_interval, global_iter)
+            #     writer.add_scalar("loss/total", running_loss_total / args.log_interval, global_iter)
+            #     writer.add_scalar("lr", scheduler.get_last_lr()[0], global_iter)
+            if ((i+1) % args.log_interval == 0 and global_iter > 0) or (i+1) >= n_total_batches:
+                if is_master_gpu():
+                    total_time_elapsed = time.time() - total_training_time
+                    delta_time_elapsed = time.time() - delta_training_time
+                    delta_training_time = time.time()
+                    printlogging(
+                        f"Epoch {epoch+1:2d}/{args.epochs:2d} | Iter {i+1:5d}/{n_total_batches:5d} | "
+                        f"Loss: {running_loss_total / args.log_interval:12.4f} | "
+                        f"Total Time: {str(timedelta(seconds=int(total_time_elapsed)))} | "
+                        f"Delta Time: {str(timedelta(seconds=int(delta_time_elapsed)))}",
+                        level="training"
+                    )
+                    writer.add_scalar("loss/mse", running_loss_mse / args.log_interval, global_iter)
+                    writer.add_scalar("loss/mvc", running_loss_mvc / args.log_interval, global_iter)
+                    writer.add_scalar("loss/gen", running_loss_gen / args.log_interval, global_iter)
+                    writer.add_scalar("loss/total", running_loss_total / args.log_interval, global_iter)
+                    writer.add_scalar("lr", scheduler.get_last_lr()[0], global_iter)
+                if SEPARATE_LOG_FILES:
+                    total_time_elapsed = time.time() - total_training_time
+                    delta_time_elapsed = time.time() - delta_training_time
+                    delta_training_time = time.time()
+                    printgpu(
+                        f"Epoch {epoch+1:2d}/{args.epochs:2d} | Iter {i+1:5d}/{n_total_batches:5d} | "
+                        f"Loss: {running_loss_total / args.log_interval:12.4f} | "
+                        f"Total Time: {str(timedelta(seconds=int(total_time_elapsed)))} | "
+                        f"Delta Time: {str(timedelta(seconds=int(delta_time_elapsed)))}"
+                    )
+                running_loss_mse = 0.0
+                running_loss_mvc = 0.0
+                running_loss_gen = 0.0
+                running_loss_total = 0.0
+
+            if ((global_iter % args.save_interval == 0 and global_iter > 0) or i+1 >= n_total_batches) and validation_loader is not None:
                 val_mse, val_mre = evaluate(
                     model=model,
                     validation_loader=validation_loader,
                     device=device,
                     vocab=vocab,
-                    pad_token=pad_token,
-                    fp16_enabled=fp16_enabled,
-                    mask_value=mask_value,
+                    pad_token=args.pad_token,
+                    fp16_enabled=args.fp16,
+                    mask_value=args.mask_value,
                     criterion=criterion,
                 )
                 writer.add_scalar("validation/mse", val_mse, global_iter)
@@ -724,168 +648,28 @@ def pretrain_streaming(
                 )
                 if SEPARATE_LOG_FILES:
                     printgpu(
-                        f"Epoch {epoch+1:2d}/{num_epochs:2d} | Iter {i+1:5d} | "
+                        f"Epoch {epoch+1:2d}/{args.epochs:2d} | Iter {i+1:5d} | "
                         f"Loss: {val_mse:12.4f} | "
                         f"Saved: {saved}"
                     )
+                if is_master_gpu():
+                    state_dict = {
+                        "epoch": epoch,
+                        "batch_idx": i,
+                        "global_iter": global_iter,
+                        "model_state": model.state_dict(),
+                        "py_random_state": random.getstate(),
+                        "torch_random_state": torch.get_rng_state().cpu(),
+                        "cuda_random_state": torch.cuda.get_rng_state_all(),
+                        "optimizer_state": optimizer.state_dict(),
+                        "scaler_state": scaler.state_dict(),
+                        "scheduler_state": scheduler.state_dict(),
+                    }
+                    torch.save(state_dict, SAVE_DIR / f"checkpoint-{epoch}-{i}.pt")
             global_iter += 1
             dist.barrier()
 
         dist.barrier()
-    writer.close()
-    printmaster("Training complete.")
-
-
-def pretrain(
-        model: DDP,
-        train_loader: DataLoader,
-        validation_loader: DataLoader,
-        criterion: nn.Module,
-        optimizer: torch.optim.Optimizer,
-        scheduler: transformers.get_scheduler,
-        num_epochs: int,
-        log_interval: int,
-        save_interval: int,
-        device: torch.device,
-        vocab: GeneVocab,
-        pad_token: str,
-        mask_value: float,
-        fp16_enabled: bool,
-        scaler: torch.cuda.amp.GradScaler,
-        grad_accu_steps: int = 1,
-    ) -> None:
-    """
-    Train the model for the specified number of epochs.
-    """
-    best_val_mse = float("inf")
-    best_val_mre = float("inf")
-    writer = SummaryWriter(log_dir=SAVE_DIR / "tensorboard")
-    total_training_time = time.time()
-    delta_training_time = time.time()
-    for epoch in range(num_epochs):
-        model.train()
-        printmaster(f"Starting epoch {epoch+1}/{num_epochs}")
-        for i, data_dict in enumerate(train_loader):
-            global_iter = epoch * len(train_loader) + i
-
-            pcpt_gene = data_dict["pcpt_gene"].to(device)
-            pcpt_expr = data_dict["pcpt_expr"].to(device)
-            gen_gene = data_dict["gen_gene"].to(device)
-            gen_expr_target = data_dict["gen_expr_target"].to(device)
-            pcpt_key_padding_mask = pcpt_gene.eq(vocab[pad_token])
-            gen_key_padding_mask = gen_gene.eq(vocab[pad_token])
-
-            if i == 0:
-                [printmaster(f"data_dict key: {k}, shape: {v.shape}") for k, v in data_dict.items()]
-
-            with torch.cuda.amp.autocast(enabled=fp16_enabled):
-                output_dict = model(
-                    pcpt_gene,
-                    pcpt_expr,
-                    pcpt_key_padding_mask,
-                    gen_gene,
-                    gen_key_padding_mask,
-                    CLS=USE_CLS,
-                    MVC=MVC,
-                    generative_training=True,
-                )
-                if i == 0:
-                    [printmaster(f"output_dict key: {k}, shape: {v.shape}") for k, v in output_dict.items()]
-
-                positions_to_match = ~gen_key_padding_mask
-                loss_mse = criterion(
-                    output_dict["gen_preds"], 
-                    gen_expr_target, 
-                    positions_to_match
-                )
-                loss_mvc = criterion(
-                    output_dict["mvc_output"][:, pcpt_gene.shape[1] :],
-                    gen_expr_target,
-                    positions_to_match,
-                )
-
-                loss_gen = torch.tensor(0.0, device=device)
-                if global_iter > 1000:
-                    previous_cell_embs = output_dict["cell_emb"].detach()
-                    preds = model(
-                        pcpt_gene,
-                        pcpt_expr,
-                        pcpt_key_padding_mask,
-                        gen_gene,
-                        gen_key_padding_mask,
-                        CLS=False,
-                        MVC=False,
-                        input_cell_emb=previous_cell_embs,
-                        generative_training=True,
-                    )["gen_preds"]
-                    loss_gen = criterion(preds, gen_expr_target, positions_to_match)
-
-                total_loss = loss_mse + loss_mvc + loss_gen
-
-            if grad_accu_steps > 1:
-                total_loss = total_loss / grad_accu_steps
-            optimizer.zero_grad()
-            scaler.scale(total_loss).backward()
-            scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(
-                model.parameters(),
-                1.0,
-            )  # gradient clipping
-            scaler.step(optimizer)
-            scaler.update()
-            if grad_accu_steps > 1:
-                if (i + 1) % grad_accu_steps == 0 or (i + 1) == len(train_loader):
-                    scheduler.step()
-            else:
-                scheduler.step()
-
-            if is_master_gpu() and global_iter % log_interval == 0 and global_iter > 0:
-                writer.add_scalar("loss/mse", loss_mse, global_iter)
-                writer.add_scalar("loss/mvc", loss_mvc, global_iter)
-                writer.add_scalar("loss/gen", loss_gen, global_iter)
-                writer.add_scalar("loss/total", total_loss, global_iter)
-                writer.add_scalar("lr", scheduler.get_last_lr()[0], global_iter)
-            if is_master_gpu() and (i + 1) % log_interval == 0 and (i + 1) > 0:
-                total_time_elapsed = time.time() - total_training_time
-                delta_time_elapsed = time.time() - delta_training_time
-                delta_training_time = time.time()
-                printlogging(
-                    f"Epoch {epoch+1:2d} | Iter {i+1:5d}/{len(train_loader)} | "
-                    f"Loss: {total_loss.item():12.4f} | "
-                    f"Total Time: {str(timedelta(seconds=int(total_time_elapsed)))} | "
-                    f"Delta Time: {str(timedelta(seconds=int(delta_time_elapsed)))}",
-                    level="training"
-                )
-
-            if (global_iter % save_interval == 0 and global_iter > 0) or (i+1) == len(train_loader):
-                val_mse, val_mre = evaluate(
-                    model=model,
-                    validation_loader=validation_loader,
-                    device=device,
-                    vocab=vocab,
-                    pad_token=pad_token,
-                    fp16_enabled=fp16_enabled,
-                    mask_value=mask_value,
-                    criterion=criterion,
-                )
-                writer.add_scalar("validation/mse", val_mse, global_iter)
-                writer.add_scalar("validation/mre", val_mre, global_iter)
-                saved = False
-                if val_mse < best_val_mse:
-                    best_val_mse = val_mse
-                    if is_master_gpu():
-                        torch.save(
-                            model.state_dict(),
-                            SAVE_DIR / "best_model_mse.pt",
-                        )
-                        saved = True
-                printlogging(
-                    f"Epoch {epoch+1:2d} | Iter {i+1:5d}/{len(train_loader)} | "
-                    f"Loss: {val_mse:12.4f} | "
-                    f"Saved: {saved}",
-                    level="validation"
-                )
-
     writer.close()
     printmaster("Training complete.")
 
@@ -991,7 +775,6 @@ def initialize_slurm_variables():
     GLOBAL_RANK   = int(os.environ["SLURM_PROCID"])
     CPUS_PER_TASK = int(os.environ["SLURM_CPUS_PER_TASK"])
     LOCAL_RANK = GLOBAL_RANK - GPUS_PER_NODE * (GLOBAL_RANK // GPUS_PER_NODE)
-    # printgpu(f"CPUS_PER_TASK: {CPUS_PER_TASK}")
     torch.cuda.set_device(LOCAL_RANK)
 
 
@@ -1019,6 +802,17 @@ def initialize_utility_variables(args: argparse.Namespace):
     scg.utils.add_file_handler(logger, SAVE_DIR / "run.log")
 
 
+def get_split_paths(args: argparse.Namespace) -> Tuple[List[Path], List[Path]]:
+    """
+    Get the training and validation data paths from the command line arguments.
+    """
+    random.shuffle(args.data_paths)
+    validation_threshold = math.ceil(len(args.data_paths) * args.valid_ratio) if args.valid_ratio > 0 else 0
+    training_files = args.data_paths[validation_threshold:]
+    validation_files = args.data_paths[:validation_threshold] if args.valid_ratio > 0 else []
+    return training_files, validation_files
+
+
 def initialize_additional_arguments(args: argparse.Namespace) -> argparse.Namespace:
     """
     Initialize additional arguments based on the provided args.
@@ -1035,7 +829,8 @@ def initialize_additional_arguments(args: argparse.Namespace) -> argparse.Namesp
     if args.training_tasks in ["gen", "both"]:
         printmaster(f"args.mask_ratio: {args.mask_ratio} (can be float or list of floats)")
         # args.mask_ratio = [0.25, 0.50, 0.75]
-    args.datapaths = argparser.get_datapaths(args)
+    args.data_paths = argparser.get_datapaths(args)
+    args.train_paths, args.valid_paths = get_split_paths(args)
     return args
 
 
@@ -1044,8 +839,7 @@ def get_arguments():
     Get command line arguments.  
     Arguments are specified in the argparser.py file.
     """
-    parser = argparser.get_parser()
-    args = parser.parse_args()
+    args = argparser._parse_args()
     argparser.validate_args(args)
     return args
 
@@ -1058,7 +852,12 @@ def main():
     runtime_startTime = time.time()
     initialize_slurm_variables()
     args = get_arguments()
-    args = initialize_additional_arguments(args)
+    if not args.checkpoint_dir:
+        args = initialize_additional_arguments(args)
+    else:
+        printmaster(f"----------------------------------------------------------------------------")
+        printmaster(f"Continuing training from directory: {args.checkpoint_dir}!!!")
+        printmaster(f"----------------------------------------------------------------------------")
     initialize_utility_variables(args)
     dump_args(args)
     setup_distributeddataparallel()
@@ -1068,95 +867,33 @@ def main():
         # Load data
         vocab = get_vocabulary(Path(args.vocab_path))
         dump_vocab(vocab)
-        train_loader, validation_loader = get_dataloaders(
-            data_paths=args.datapaths,
-            validation_ratio=args.valid_ratio, 
-            vocab=vocab,
-            max_seq_len=args.max_seq_len,
-            pad_token=args.pad_token,
-            pad_value=args.pad_value,
-            input_style=args.input_style,
-            mask_ratio=args.mask_ratio,
-            mask_value=args.mask_value,
-            trunc_by_sample=args.trunc_by_sample,
-            training_tasks=args.training_tasks,
-            batch_size=args.batch_size,
-            subset_ratio=args.subset_ratio,
-            streaming=args.streaming,
-            cache_dir=args.cache_dir,
-        )
+        train_loader, validation_loader = get_dataloaders(args=args, vocab=vocab)
         dist.barrier()
         time.sleep(2)
         # Initialize model, criterion, optimizer, scheduler
-        ddp_model = get_model(
-            embedding_size=args.embsize,
-            number_of_heads=args.nheads,
-            hidden_size=args.d_hid,
-            number_of_layers=args.nlayers,
-            number_of_layers_cls=args.n_layers_cls,
-            dropout=args.dropout,
-            pad_token=args.pad_token,
-            pad_value=args.pad_value,
-            input_emb_style=args.input_emb_style,
-            number_of_input_bins=args.n_input_bins,
-            use_generative_training=True if args.training_tasks in ["gen", "both"] else False,
-            use_fast_transformer=args.fast_transformer,
-            vocab=vocab
-        )
+        ddp_model = get_model(args=args, vocab=vocab)
         criterion = masked_mse_loss
         optimizer = torch.optim.Adam(ddp_model.parameters(), lr=args.lr)
         scheduler = get_scheduler(
+            args=args,
             optimizer=optimizer,
-            warmup_ratio_or_steps=args.warmup_ratio_or_steps,
             train_loader=train_loader,
-            epochs=args.epochs,
-            scheduler_interval=args.scheduler_interval,
-            scheduler_factor=args.scheduler_factor,
-            streaming=args.streaming,
-            data_paths=args.datapaths if args.streaming else None,
         )
         dist.barrier()
         time.sleep(2)
         # start training
-        if args.streaming:
-            pretrain_streaming(
-                model=ddp_model,
-                train_loader=train_loader,
-                validation_loader=validation_loader,
-                criterion=criterion,
-                optimizer=optimizer,
-                scheduler=scheduler,
-                num_epochs=args.epochs,
-                log_interval=args.log_interval,
-                save_interval=args.save_interval,
-                device=torch.device(LOCAL_RANK),
-                vocab=vocab,
-                pad_token=args.pad_token,
-                mask_value=args.mask_value,
-                fp16_enabled=args.fp16,
-                scaler=torch.cuda.amp.GradScaler(enabled=args.fp16),
-                grad_accu_steps=args.grad_accu_steps,
-                n_total_batches=get_total_batch_count_per_GPU(args.datapaths, args.batch_size),
-            )
-        else:
-            pretrain(
-                model=ddp_model,
-                train_loader=train_loader,
-                validation_loader=validation_loader,
-                criterion=criterion,
-                optimizer=optimizer,
-                scheduler=scheduler,
-                num_epochs=args.epochs,
-                log_interval=args.log_interval,
-                save_interval=args.save_interval,
-                device=torch.device(LOCAL_RANK),
-                vocab=vocab,
-                pad_token=args.pad_token,
-                mask_value=args.mask_value,
-                fp16_enabled=args.fp16,
-                scaler=torch.cuda.amp.GradScaler(enabled=args.fp16),
-                grad_accu_steps=args.grad_accu_steps,
-            )
+        pretrain(
+            args=args,
+            model=ddp_model,
+            train_loader=train_loader,
+            validation_loader=validation_loader,
+            criterion=criterion,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            device=torch.device(LOCAL_RANK),
+            vocab=vocab,
+            scaler=torch.cuda.amp.GradScaler(enabled=args.fp16)
+        )
     finally:
         if dist.is_initialized():
             dist.barrier()
