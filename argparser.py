@@ -313,9 +313,11 @@ def _parse_args() -> argparse.Namespace:
     if args.checkpoint_dir is not None:
         checkpoint_dir = args.checkpoint_dir
         save_dir = args.save_dir
+        epochs = args.epochs
         args = load_args_from_model_dir(checkpoint_dir)
         args.checkpoint_dir = checkpoint_dir
         args.save_dir = save_dir
+        args.epochs = epochs
     return args
 
 

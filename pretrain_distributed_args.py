@@ -251,6 +251,7 @@ def create_datasets(args: argparse.Namespace) -> Tuple[Dataset, Dataset]:
         split="train",  # specify train to load all the data into a dataset directly and not a dataset dict
         streaming=True,
     )
+    train_dataset = train_dataset.shuffle(seed=SEED, buffer_size=10_000)
     train_dataset = train_dataset.with_format("torch")
 
     if len(validation_files) > 0:
@@ -493,6 +494,10 @@ def pretrain(
             continue
         printmaster(f"Starting epoch {epoch+1}/{args.epochs}")
 
+        if hasattr(train_loader, "dataset") and hasattr(train_loader.dataset, "set_epoch"):
+            train_loader.dataset.set_epoch(epoch)
+        elif i == 0:
+            printmaster("Warning: train_loader.dataset has no set_epoch method, shuffling may not be deterministic across epochs.")
         running_loss_mse = 0.0
         running_loss_mvc = 0.0
         running_loss_gen = 0.0
@@ -567,6 +572,9 @@ def pretrain(
                 model.parameters(),
                 1.0,
             )  # gradient clipping
+            if not math.isfinite(total_loss):
+                print(f"Non-finite loss detected: {total_loss.item()} at epoch {epoch}, batch {i}. Skipping batch and continuing training.")
+                continue
             scaler.step(optimizer)
             scaler.update()
             if args.grad_accu_steps > 1:
@@ -580,98 +588,105 @@ def pretrain(
             running_loss_mvc += loss_mvc.item()
             running_loss_gen += loss_gen.item()
             running_loss_total += total_loss.item()
-            # if is_master_gpu() and ((global_iter % args.log_interval == 0 and global_iter > 0) or (i+1) >= n_total_batches):
-            #     writer.add_scalar("loss/mse", running_loss_mse / args.log_interval, global_iter)
-            #     writer.add_scalar("loss/mvc", running_loss_mvc / args.log_interval, global_iter)
-            #     writer.add_scalar("loss/gen", running_loss_gen / args.log_interval, global_iter)
-            #     writer.add_scalar("loss/total", running_loss_total / args.log_interval, global_iter)
-            #     writer.add_scalar("lr", scheduler.get_last_lr()[0], global_iter)
-            if ((i+1) % args.log_interval == 0 and global_iter > 0) or (i+1) >= n_total_batches:
-                if is_master_gpu():
-                    total_time_elapsed = time.time() - total_training_time
-                    delta_time_elapsed = time.time() - delta_training_time
-                    delta_training_time = time.time()
-                    printlogging(
-                        f"Epoch {epoch+1:2d}/{args.epochs:2d} | Iter {i+1:5d}/{n_total_batches:5d} | "
-                        f"Loss: {running_loss_total / args.log_interval:12.4f} | "
-                        f"Total Time: {str(timedelta(seconds=int(total_time_elapsed)))} | "
-                        f"Delta Time: {str(timedelta(seconds=int(delta_time_elapsed)))}",
-                        level="training"
-                    )
-                    writer.add_scalar("loss/mse", running_loss_mse / args.log_interval, global_iter)
-                    writer.add_scalar("loss/mvc", running_loss_mvc / args.log_interval, global_iter)
-                    writer.add_scalar("loss/gen", running_loss_gen / args.log_interval, global_iter)
-                    writer.add_scalar("loss/total", running_loss_total / args.log_interval, global_iter)
-                    writer.add_scalar("lr", scheduler.get_last_lr()[0], global_iter)
-                if SEPARATE_LOG_FILES:
-                    total_time_elapsed = time.time() - total_training_time
-                    delta_time_elapsed = time.time() - delta_training_time
-                    delta_training_time = time.time()
-                    printgpu(
-                        f"Epoch {epoch+1:2d}/{args.epochs:2d} | Iter {i+1:5d}/{n_total_batches:5d} | "
-                        f"Loss: {running_loss_total / args.log_interval:12.4f} | "
-                        f"Total Time: {str(timedelta(seconds=int(total_time_elapsed)))} | "
-                        f"Delta Time: {str(timedelta(seconds=int(delta_time_elapsed)))}"
-                    )
-                running_loss_mse = 0.0
-                running_loss_mvc = 0.0
-                running_loss_gen = 0.0
-                running_loss_total = 0.0
+            if ((i+1) % args.log_interval == 0):
+                log_training(args, scheduler, writer, total_training_time, delta_training_time, n_total_batches, global_iter, epoch, running_loss_mse, running_loss_mvc, running_loss_gen, running_loss_total, i)
+                running_loss_mse, running_loss_mvc, running_loss_gen, running_loss_total = 0.0, 0.0, 0.0, 0.0
 
             if ((global_iter % args.save_interval == 0 and global_iter > 0) or i+1 >= n_total_batches) and validation_loader is not None:
-                val_mse, val_mre = evaluate(
-                    model=model,
-                    validation_loader=validation_loader,
-                    device=device,
-                    vocab=vocab,
-                    pad_token=args.pad_token,
-                    fp16_enabled=args.fp16,
-                    mask_value=args.mask_value,
-                    criterion=criterion,
-                )
-                writer.add_scalar("validation/mse", val_mse, global_iter)
-                writer.add_scalar("validation/mre", val_mre, global_iter)
-                saved = False
-                if val_mse < best_val_mse:
-                    best_val_mse = val_mse
-                    if is_master_gpu():
-                        torch.save(
-                            model.state_dict(),
-                            SAVE_DIR / "best_model_mse.pt",
-                        )
-                        saved = True
-                printlogging(
-                    f"Epoch {epoch+1:2d} | Iter {i+1:5d} | "
-                    f"Loss: {val_mse:12.4f} | "
-                    f"Saved: {saved}",
-                    level="validation"
-                )
-                if SEPARATE_LOG_FILES:
-                    printgpu(
-                        f"Epoch {epoch+1:2d}/{args.epochs:2d} | Iter {i+1:5d} | "
-                        f"Loss: {val_mse:12.4f} | "
-                        f"Saved: {saved}"
-                    )
-                if is_master_gpu():
-                    state_dict = {
-                        "epoch": epoch,
-                        "batch_idx": i,
-                        "global_iter": global_iter,
-                        "model_state": model.state_dict(),
-                        "py_random_state": random.getstate(),
-                        "torch_random_state": torch.get_rng_state().cpu(),
-                        "cuda_random_state": torch.cuda.get_rng_state_all(),
-                        "optimizer_state": optimizer.state_dict(),
-                        "scaler_state": scaler.state_dict(),
-                        "scheduler_state": scheduler.state_dict(),
-                    }
-                    torch.save(state_dict, SAVE_DIR / f"checkpoint-{epoch}-{i}.pt")
+                best_val_mse = eval_and_save(args, model, validation_loader, criterion, optimizer, scheduler, device, vocab, scaler, best_val_mse, writer, global_iter, epoch, i)
             global_iter += 1
             dist.barrier()
 
         dist.barrier()
     writer.close()
     printmaster("Training complete.")
+
+
+def log_training(args, scheduler, writer, total_training_time, delta_training_time, n_total_batches, global_iter, epoch, running_loss_mse, running_loss_mvc, running_loss_gen, running_loss_total, i):
+    if is_master_gpu():
+        total_time_elapsed = time.time() - total_training_time
+        delta_time_elapsed = time.time() - delta_training_time
+        delta_training_time = time.time()
+        printlogging(
+            f"Epoch {epoch+1:2d}/{args.epochs:2d} | Iter {i+1:5d}/{n_total_batches:5d} | "
+            f"Loss: {running_loss_total / args.log_interval:12.4f} | "
+            f"Total Time: {str(timedelta(seconds=int(total_time_elapsed)))} | "
+            f"Delta Time: {str(timedelta(seconds=int(delta_time_elapsed)))}",
+            level="training"
+        )
+        writer.add_scalar("loss/mse", running_loss_mse / args.log_interval, global_iter)
+        writer.add_scalar("loss/mvc", running_loss_mvc / args.log_interval, global_iter)
+        writer.add_scalar("loss/gen", running_loss_gen / args.log_interval, global_iter)
+        writer.add_scalar("loss/total", running_loss_total / args.log_interval, global_iter)
+        writer.add_scalar("lr", scheduler.get_last_lr()[0], global_iter)
+    # if SEPARATE_LOG_FILES:
+    #     total_time_elapsed = time.time() - total_training_time
+    #     delta_time_elapsed = time.time() - delta_training_time
+    #     delta_training_time = time.time()
+    #     printgpu(
+    #         f"Epoch {epoch+1:2d}/{args.epochs:2d} | Iter {i+1:5d}/{n_total_batches:5d} | "
+    #         f"Loss: {running_loss_total / args.log_interval:12.4f} | "
+    #         f"Total Time: {str(timedelta(seconds=int(total_time_elapsed)))} | "
+    #         f"Delta Time: {str(timedelta(seconds=int(delta_time_elapsed)))}"
+    #     )
+
+
+def eval_and_save(args, model, validation_loader, criterion, optimizer, scheduler, device, vocab, scaler, best_val_mse, writer, total_training_time, delta_training_time, global_iter, epoch, i):
+    val_mse, val_mre = evaluate(
+        model=model,
+        validation_loader=validation_loader,
+        device=device,
+        vocab=vocab,
+        pad_token=args.pad_token,
+        fp16_enabled=args.fp16,
+        mask_value=args.mask_value,
+        criterion=criterion,
+    )
+    writer.add_scalar("validation/mse", val_mse, global_iter)
+    writer.add_scalar("validation/mre", val_mre, global_iter)
+    saved = False
+    if val_mse < best_val_mse:
+        best_val_mse = val_mse
+        if is_master_gpu():
+            torch.save(
+                            model.state_dict(),
+                            SAVE_DIR / "best_model_mse.pt",
+                        )
+            saved = True
+            
+    total_time_elapsed = time.time() - total_training_time
+    delta_time_elapsed = time.time() - delta_training_time
+    delta_training_time = time.time()
+    printlogging(
+        f"Epoch {epoch+1:2d} | Iter {i+1:5d} | "
+        f"MSE: {val_mse:4.4f} | "
+        f"MRE: {val_mre:4.4f} | "
+        f"Saved: {saved} | "
+        f"Total Time: {str(timedelta(seconds=int(total_time_elapsed)))} | "
+        f"Delta Time: {str(timedelta(seconds=int(delta_time_elapsed)))}",
+        level="validation"
+    )
+    # if SEPARATE_LOG_FILES:
+    #     printgpu(
+    #         f"Epoch {epoch+1:2d}/{args.epochs:2d} | Iter {i+1:5d} | "
+    #         f"Loss: {val_mse:12.4f} | "
+    #         f"Saved: {saved}"
+    #     )
+    if is_master_gpu():
+        state_dict = {
+            "epoch": epoch,
+            "batch_idx": i,
+            "global_iter": global_iter,
+            "model_state": model.state_dict(),
+            "py_random_state": random.getstate(),
+            "torch_random_state": torch.get_rng_state().cpu(),
+            "cuda_random_state": torch.cuda.get_rng_state_all(),
+            "optimizer_state": optimizer.state_dict(),
+            "scaler_state": scaler.state_dict(),
+            "scheduler_state": scheduler.state_dict(),
+        }
+        torch.save(state_dict, SAVE_DIR / f"checkpoint-{epoch}-{i}.pt")
+    return best_val_mse
 
 
 def evaluate(
