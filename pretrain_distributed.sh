@@ -3,21 +3,22 @@
 # See `man sbatch` or https://slurm.schedmd.com/sbatch.html for descriptions of sbatch options.
 #SBATCH --job-name=scGPT_pretrain              # Gets overwritten by run_and_monitor_job.sh!
 #SBATCH --nodes=1                                     # Number of nodes to request
-#SBATCH --ntasks-per-node=2                           # total number of tasks per node
+#SBATCH --ntasks-per-node=4                           # total number of tasks per node
 #SBATCH --cpus-per-task=4                             # Number of CPUs to request
-#SBATCH --gres=gpu:a100:2                             # Number of GPUs to request
+#SBATCH --gres=gpu:a100:4                             # Number of GPUs to request
 #SBATCH --mem-per-gpu=4GB
-#SBATCH --partition=standby
+#SBATCH --partition=ampere
 #SBATCH --output=/home/hauke.schuele/scGPT_distributed/logs/%x-%j.out  # File to which STDOUT will be written
 #SBATCH --error=/home/hauke.schuele/scGPT_distributed/logs/%x-%j.err   # File to which STDERR will be written
+#SBATCH --time=00:15:00              # Time limit (hh:mm:ss) debug time
+echo ""
 #SBATCH --mail-user=hauke.schuele@stud.uni-hannover.de
 #SBATCH --mail-type=ALL       # Type of email notification- BEGIN,END,FAIL,ALL
-#SBATCH --time=10-00:00:00              # Time limit (hh:mm:ss)
-echo ""
+#SBATCH --time=10-00:00:00              # Time limit (hh:mm:ss) production time
 
 module load mamba
-micromamba activate scgpt_stateful
-# micromamba activate scgpt_pretrain
+# micromamba activate scgpt_stateful
+micromamba activate scgpt_manual
 
 # SLURM parameters
 master_address=$(scontrol show hostnames $SLURM_JOB_NODELIST | head -n 1)
@@ -85,9 +86,9 @@ srun python -u scGPT_distributed/pretrain_distributed_args.py \
     --training-tasks "both" \
     --save-dir ./save/pretrain-distributed-[$SLURM_JOB_ID]-$(date +%Y-%m-%d_%H-%M-%S) \
     --vocab-path "/data/datasets/biology/scGPT-data/preprocessed/default_census_vocab.json" \
-    --save-interval 5 \
-    --log-interval 2 \
-    --batch-size 128 \
+    --save-interval 10000 \
+    --log-interval 250 \
+    --batch-size 24 \
     --valid-ratio 0.04 \
     --trunc-by-sample \
     --no-cls \
@@ -97,8 +98,9 @@ srun python -u scGPT_distributed/pretrain_distributed_args.py \
     --interleaved "$interleaved" \
     --lr 0.0001 \
     --warmup-ratio-or-steps 10000 \
-    # --nlayers 12 \
-    # --nheads 8 \
-    # --embsize 512 \
-    # --d-hid 512 \
+    --nlayers 12 \
+    --nheads 8 \
+    --embsize 512 \
+    --d-hid 512 \
+    --shuffle-buffer-size 0 \
     # --checkpoint-dir "/home/hauke.schuele/save/pretrain-distributed-[257990]-2025-11-18_00-27-20" \

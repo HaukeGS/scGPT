@@ -123,7 +123,7 @@ def add_arguments(parser: argparse.ArgumentParser):
     parser.add_argument(
         "--max-seq-len",
         type=int,
-        default=1000,
+        default=1200,
         help="The maximum length of the sequence. Default is 1000. The actual used "
         "max length would be the minimum of this value and the length of the longest "
         "sequence in the data.",
@@ -194,6 +194,12 @@ def add_arguments(parser: argparse.ArgumentParser):
         type=float,
         default=1e-3,
         help="The learning rate for training. Default is 1e-3.",
+    )
+    parser.add_argument(
+        "--shuffle-buffer-size",
+        type=int,
+        default=0,
+        help="The buffer size for shuffling the data at the beginning of each epoch. Default is 0 and thus shuffling is disabled.",
     )
     parser.add_argument(
         "--scheduler-interval",

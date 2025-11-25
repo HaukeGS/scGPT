@@ -251,7 +251,8 @@ def create_datasets(args: argparse.Namespace) -> Tuple[Dataset, Dataset]:
         split="train",  # specify train to load all the data into a dataset directly and not a dataset dict
         streaming=True,
     )
-    train_dataset = train_dataset.shuffle(seed=SEED, buffer_size=10_000)
+    if args.shuffle_buffer_size > 0:
+        train_dataset = train_dataset.shuffle(buffer_size=args.shuffle_buffer_size, seed=42)
     train_dataset = train_dataset.with_format("torch")
 
     if len(validation_files) > 0:
@@ -480,8 +481,9 @@ def pretrain(
     best_val_mse = float("inf")
     best_val_mre = float("inf")
     writer = SummaryWriter(log_dir=SAVE_DIR / "tensorboard")
-    total_training_time = time.time()
+    training_start_time = time.time()
     delta_training_time = time.time()
+
     is_last_batch = False
     n_total_batches=get_total_batch_count_per_GPU(args.train_paths, args.batch_size)
     global_iter, epoch_offset, batch_offset = 0, 0, 0
@@ -494,10 +496,11 @@ def pretrain(
             continue
         printmaster(f"Starting epoch {epoch+1}/{args.epochs}")
 
-        if hasattr(train_loader, "dataset") and hasattr(train_loader.dataset, "set_epoch"):
-            train_loader.dataset.set_epoch(epoch)
-        elif i == 0:
-            printmaster("Warning: train_loader.dataset has no set_epoch method, shuffling may not be deterministic across epochs.")
+        if args.shuffle_buffer_size > 0:
+            if hasattr(train_loader, "dataset") and hasattr(train_loader.dataset, "set_epoch"):
+                train_loader.dataset.set_epoch(epoch)
+            elif i == 0:
+                printmaster("Warning: train_loader.dataset has no set_epoch method, shuffling may not be deterministic across epochs.")
         running_loss_mse = 0.0
         running_loss_mvc = 0.0
         running_loss_gen = 0.0
@@ -589,22 +592,26 @@ def pretrain(
             running_loss_gen += loss_gen.item()
             running_loss_total += total_loss.item()
             if ((i+1) % args.log_interval == 0):
-                log_training(args, scheduler, writer, total_training_time, delta_training_time, n_total_batches, global_iter, epoch, running_loss_mse, running_loss_mvc, running_loss_gen, running_loss_total, i)
+                delta_training_time = log_training(args, scheduler, writer, training_start_time, delta_training_time, n_total_batches, global_iter, epoch, running_loss_mse, running_loss_mvc, running_loss_gen, running_loss_total, i)
                 running_loss_mse, running_loss_mvc, running_loss_gen, running_loss_total = 0.0, 0.0, 0.0, 0.0
 
-            if ((global_iter % args.save_interval == 0 and global_iter > 0) or i+1 >= n_total_batches) and validation_loader is not None:
-                best_val_mse = eval_and_save(args, model, validation_loader, criterion, optimizer, scheduler, device, vocab, scaler, best_val_mse, writer, global_iter, epoch, i)
+            if ((i+1) % args.save_interval == 0) and validation_loader is not None:
+                best_val_mse, delta_training_time = eval_and_save(args, model, train_loader, validation_loader, criterion, optimizer, scheduler, device, vocab, scaler, best_val_mse, writer, training_start_time, delta_training_time, global_iter, epoch, i)
             global_iter += 1
             dist.barrier()
 
+        delta_training_time = log_training(args, scheduler, writer, training_start_time, delta_training_time, n_total_batches, global_iter, epoch, running_loss_mse, running_loss_mvc, running_loss_gen, running_loss_total, i)
+        running_loss_mse, running_loss_mvc, running_loss_gen, running_loss_total = 0.0, 0.0, 0.0, 0.0
+        if validation_loader is not None:
+            best_val_mse, delta_training_time = eval_and_save(args, model, train_loader, validation_loader, criterion, optimizer, scheduler, device, vocab, scaler, best_val_mse, writer, training_start_time, delta_training_time, global_iter, epoch+1, 0)
         dist.barrier()
     writer.close()
     printmaster("Training complete.")
 
 
-def log_training(args, scheduler, writer, total_training_time, delta_training_time, n_total_batches, global_iter, epoch, running_loss_mse, running_loss_mvc, running_loss_gen, running_loss_total, i):
+def log_training(args, scheduler, writer, training_start_time, delta_training_time, n_total_batches, global_iter, epoch, running_loss_mse, running_loss_mvc, running_loss_gen, running_loss_total, i):
     if is_master_gpu():
-        total_time_elapsed = time.time() - total_training_time
+        total_time_elapsed = time.time() - training_start_time
         delta_time_elapsed = time.time() - delta_training_time
         delta_training_time = time.time()
         printlogging(
@@ -629,9 +636,11 @@ def log_training(args, scheduler, writer, total_training_time, delta_training_ti
     #         f"Total Time: {str(timedelta(seconds=int(total_time_elapsed)))} | "
     #         f"Delta Time: {str(timedelta(seconds=int(delta_time_elapsed)))}"
     #     )
+        return delta_training_time
+    return 0
 
 
-def eval_and_save(args, model, validation_loader, criterion, optimizer, scheduler, device, vocab, scaler, best_val_mse, writer, total_training_time, delta_training_time, global_iter, epoch, i):
+def eval_and_save(args, model, train_loader, validation_loader, criterion, optimizer, scheduler, device, vocab, scaler, best_val_mse, writer, training_start_time, delta_training_time, global_iter, epoch, i):
     val_mse, val_mre = evaluate(
         model=model,
         validation_loader=validation_loader,
@@ -654,7 +663,7 @@ def eval_and_save(args, model, validation_loader, criterion, optimizer, schedule
                         )
             saved = True
             
-    total_time_elapsed = time.time() - total_training_time
+    total_time_elapsed = time.time() - training_start_time
     delta_time_elapsed = time.time() - delta_training_time
     delta_training_time = time.time()
     printlogging(
@@ -678,6 +687,7 @@ def eval_and_save(args, model, validation_loader, criterion, optimizer, schedule
             "batch_idx": i,
             "global_iter": global_iter,
             "model_state": model.state_dict(),
+            "dataloader_state": train_loader.state_dict() if hasattr(train_loader, "state_dict") else None,
             "py_random_state": random.getstate(),
             "torch_random_state": torch.get_rng_state().cpu(),
             "cuda_random_state": torch.cuda.get_rng_state_all(),
@@ -685,8 +695,8 @@ def eval_and_save(args, model, validation_loader, criterion, optimizer, schedule
             "scaler_state": scaler.state_dict(),
             "scheduler_state": scheduler.state_dict(),
         }
-        torch.save(state_dict, SAVE_DIR / f"checkpoint-{epoch}-{i}.pt")
-    return best_val_mse
+        torch.save(state_dict, SAVE_DIR / f"checkpoint-{epoch+1}-{i+1}.pt")
+    return best_val_mse, delta_training_time
 
 
 def evaluate(
@@ -704,6 +714,7 @@ def evaluate(
     Expects the Validation_loader to be distributed.
     Averages the loss values across all GPUs.
     """
+    # add UMAP after evaluation and metrics from scpgt evaluation (integration tutorial)
     model.eval()
     total_mse = 0.0
     total_mre = 0.0
@@ -842,8 +853,8 @@ def initialize_additional_arguments(args: argparse.Namespace) -> argparse.Namesp
         args.n_input_bins = args.n_bins
 
     if args.training_tasks in ["gen", "both"]:
+        args.mask_ratio = [0.25, 0.50, 0.75]
         printmaster(f"args.mask_ratio: {args.mask_ratio} (can be float or list of floats)")
-        # args.mask_ratio = [0.25, 0.50, 0.75]
     args.data_paths = argparser.get_datapaths(args)
     args.train_paths, args.valid_paths = get_split_paths(args)
     return args
