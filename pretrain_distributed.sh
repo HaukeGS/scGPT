@@ -88,7 +88,7 @@ srun python -u scGPT_distributed/pretrain_distributed_args.py \
     --vocab-path "/data/datasets/biology/scGPT-data/preprocessed/default_census_vocab.json" \
     --save-interval 50000 \
     --log-interval 1000 \
-    --batch-size 24 \
+    --batch-size 20 \
     --valid-ratio 0.04 \
     --trunc-by-sample \
     --no-cls \
