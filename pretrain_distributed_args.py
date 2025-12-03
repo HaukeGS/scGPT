@@ -194,56 +194,98 @@ def validate_sample_distribution(shards: List[str], sample_type: str = "") -> No
 
 
 
-def create_datasets(args: argparse.Namespace) -> Tuple[Dataset, Dataset]:
-    """
-    Load the dataset from the specified data source in streaming mode.
-    data_source is a list of .parquet files. 
-    Each file is assumed to be a shard of the dataset and should be of equal size.
+# def create_datasets(args: argparse.Namespace) -> Tuple[Dataset, Dataset]:
+#     """
+#     Load the dataset from the specified data source in streaming mode.
+#     data_source is a list of .parquet files. 
+#     Each file is assumed to be a shard of the dataset and should be of equal size.
 
-    args:
-        data_paths: List[Path]: 
-            The paths to the data directories.
-        validation_ratio: float: 
-            The ratio of the dataset to use for validation.
-            Uses every 1/validation_ratio shard for validation.
-            Note: this is approximate, as the number of shards may not be divisible by validation_ratio.
-            Note: this might result in uneven shard distribution across GPUs if n_shards in a tissue is not divisible by 1/validation_ratio.
-            Best Example: For 25 shards, use validation_ratio=0.04 as 1/0.04=25 and thus every 25th shard will be used for validation.
-        subset_ratio: float: (optional, default=1.0)
-            The ratio of the dataset to use for training.
-    returns:
-        train_dataset: Dataset
-            The interleaved training dataset.
-        validation_dataset: Dataset
-            The interleaved validation dataset.
-    """
+#     args:
+#         data_paths: List[Path]: 
+#             The paths to the data directories.
+#         validation_ratio: float: 
+#             The ratio of the dataset to use for validation.
+#             Uses every 1/validation_ratio shard for validation.
+#             Note: this is approximate, as the number of shards may not be divisible by validation_ratio.
+#             Note: this might result in uneven shard distribution across GPUs if n_shards in a tissue is not divisible by 1/validation_ratio.
+#             Best Example: For 25 shards, use validation_ratio=0.04 as 1/0.04=25 and thus every 25th shard will be used for validation.
+#         subset_ratio: float: (optional, default=1.0)
+#             The ratio of the dataset to use for training.
+#     returns:
+#         train_dataset: Dataset
+#             The interleaved training dataset.
+#         validation_dataset: Dataset
+#             The interleaved validation dataset.
+#     """
+#     if not args.data_paths:
+#         raise ValueError("No data_paths provided")
+#     if args.subset_ratio < 1.0:
+#         raise ValueError("subset_ratio < 1.0 not yet supported for streaming datasets")
+#         # TODO: implement subset_ratio for streaming datasets
+
+#     training_files = args.train_paths
+#     validation_files = args.valid_paths
+#     printmaster(f"Total number of shards: {len(args.data_paths)}")
+#     printmaster(f"Number of training shards: {len(training_files)}")
+#     printmaster(f"Number of validation shards: {len(validation_files)}")
+#     training_shards = [str(file) for i, file in enumerate(training_files) if (i % WORLD_SIZE) == GLOBAL_RANK]
+#     if len(validation_files) % WORLD_SIZE == 0:
+#         validation_shards = [str(file) for i, file in enumerate(validation_files) if (i % WORLD_SIZE) == GLOBAL_RANK]
+#     else:
+#         printmaster(f"Warning: number of validation shards {len(validation_files)} is not divisible by WORLD_SIZE {WORLD_SIZE}, so every GPU is getting all validation shards, which is not ideal.")
+#         validation_shards = [str(file) for file in validation_files]
+#     printgpu(f"training_shards ({len(training_shards)}): {json.dumps(training_shards, indent=2)}")
+#     printgpu(f"validation_shards ({len(validation_shards)}): {json.dumps(validation_shards, indent=2)}")
+
+#     if not training_shards:
+#         raise FileNotFoundError(f"No shards found on rank {GLOBAL_RANK}")
+
+#     validate_shard_distribution(training_shards, "Training")
+#     validate_sample_distribution(training_shards, "Training")
+#     validate_shard_distribution(validation_shards, "Validation")
+#     validate_sample_distribution(validation_shards, "Validation")
+
+#     train_dataset = load_dataset(
+#         "parquet",
+#         data_files=training_shards,
+#         split="train",  # specify train to load all the data into a dataset directly and not a dataset dict
+#         streaming=True,
+#     )
+#     if args.shuffle_buffer_size > 0:
+#         train_dataset = train_dataset.shuffle(buffer_size=args.shuffle_buffer_size, seed=42)
+#     train_dataset = train_dataset.with_format("torch")
+
+#     if len(validation_files) > 0:
+#         validation_dataset = load_dataset(
+#             "parquet",
+#             data_files=validation_shards,
+#             split="train",  # specify train to load all the data into a dataset directly and not a dataset dict
+#             streaming=True,
+#         )
+#         validation_dataset = validation_dataset.with_format("torch")
+#     else:
+#         validation_dataset = None
+#         printmaster(f"No validation shards found because validation_ratio <= 0")
+
+#     return train_dataset, validation_dataset
+
+
+def create_train_dataset(args: argparse.Namespace, epoch: int) -> Dataset:
     if not args.data_paths:
         raise ValueError("No data_paths provided")
-    if args.subset_ratio < 1.0:
-        raise ValueError("subset_ratio < 1.0 not yet supported for streaming datasets")
-        # TODO: implement subset_ratio for streaming datasets
 
     training_files = args.train_paths
-    validation_files = args.valid_paths
+    random.Random(SEED + epoch).shuffle(training_files)
     printmaster(f"Total number of shards: {len(args.data_paths)}")
     printmaster(f"Number of training shards: {len(training_files)}")
-    printmaster(f"Number of validation shards: {len(validation_files)}")
     training_shards = [str(file) for i, file in enumerate(training_files) if (i % WORLD_SIZE) == GLOBAL_RANK]
-    if len(validation_files) % WORLD_SIZE == 0:
-        validation_shards = [str(file) for i, file in enumerate(validation_files) if (i % WORLD_SIZE) == GLOBAL_RANK]
-    else:
-        printmaster(f"Warning: number of validation shards {len(validation_files)} is not divisible by WORLD_SIZE {WORLD_SIZE}, so every GPU is getting all validation shards, which is not ideal.")
-        validation_shards = [str(file) for file in validation_files]
     printgpu(f"training_shards ({len(training_shards)}): {json.dumps(training_shards, indent=2)}")
-    printgpu(f"validation_shards ({len(validation_shards)}): {json.dumps(validation_shards, indent=2)}")
 
     if not training_shards:
         raise FileNotFoundError(f"No shards found on rank {GLOBAL_RANK}")
 
     validate_shard_distribution(training_shards, "Training")
     validate_sample_distribution(training_shards, "Training")
-    validate_shard_distribution(validation_shards, "Validation")
-    validate_sample_distribution(validation_shards, "Validation")
 
     train_dataset = load_dataset(
         "parquet",
@@ -254,101 +296,134 @@ def create_datasets(args: argparse.Namespace) -> Tuple[Dataset, Dataset]:
     if args.shuffle_buffer_size > 0:
         train_dataset = train_dataset.shuffle(buffer_size=args.shuffle_buffer_size, seed=42)
     train_dataset = train_dataset.with_format("torch")
+    return train_dataset
 
-    if len(validation_files) > 0:
-        validation_dataset = load_dataset(
-            "parquet",
-            data_files=validation_shards,
-            split="train",  # specify train to load all the data into a dataset directly and not a dataset dict
-            streaming=True,
-        )
-        validation_dataset = validation_dataset.with_format("torch")
+
+def create_validation_dataset(args: argparse.Namespace) -> Dataset:
+    validation_files = args.valid_paths
+    printmaster(f"Number of validation shards: {len(validation_files)}")
+    if len(validation_files) % WORLD_SIZE == 0:
+        validation_shards = [str(file) for i, file in enumerate(validation_files) if (i % WORLD_SIZE) == GLOBAL_RANK]
     else:
-        validation_dataset = None
-        printmaster(f"No validation shards found because validation_ratio <= 0")
-
-    return train_dataset, validation_dataset
-
-
-def create_collator(
-        vocab: GeneVocab, 
-        max_seq_len: int, 
-        pad_token: str, 
-        pad_value: int,
-        input_style: str,
-        mask_ratio: Union[float, List[float]],
-        mask_value: float,
-        trunc_by_sample: bool,
-        training_tasks: str,
-    ) -> scg.DataCollator:
-    """
-    Create a data collator for the dataloader with provided arguments.
-    """
-    collator = scg.DataCollator(
-        do_padding=True if max_seq_len is not None else False,
-        pad_token_id=vocab[pad_token],
-        pad_value=pad_value,
-        do_mlm=True,
-        do_binning=True if input_style == "binned" else False,
-        mlm_probability=mask_ratio,
-        mask_value=mask_value,
-        max_length=max_seq_len,
-        sampling=trunc_by_sample,
-        data_style=training_tasks,
+        printmaster(f"Warning: number of validation shards {len(validation_files)} is not divisible by WORLD_SIZE {WORLD_SIZE}, so every GPU is getting all validation shards, which is not ideal.")
+        validation_shards = [str(file) for file in validation_files]
+    printgpu(f"validation_shards ({len(validation_shards)}): {json.dumps(validation_shards, indent=2)}")
+    validate_shard_distribution(validation_shards, "Validation")
+    validate_sample_distribution(validation_shards, "Validation")
+    validation_dataset = load_dataset(
+        "parquet",
+        data_files=validation_shards,
+        split="train",  # specify train to load all the data into a dataset directly and not a dataset dict
+        streaming=True,
     )
-    return collator
+    validation_dataset = validation_dataset.with_format("torch")
+    return validation_dataset
 
 
-def create_dataloaders(train_dataset: Dataset, validation_dataset: Dataset, batch_size: int, collator: scg.DataCollator) -> Tuple[DataLoader, DataLoader]:
-    """
-    Get the dataloaders for training and validation datasets.
-    Uses DistributedSampler for the training loader and uses the full validation dataset for the validation loader.
-    """
-    train_loader = DataLoader(
-        train_dataset,
+def create_dataloader(dataset: Dataset, collator: scg.DataCollator, batch_size: int) -> DataLoader:    
+    dataloader = DataLoader(
+        dataset,
         batch_size=batch_size,
-        num_workers=min(CPUS_PER_TASK, train_dataset.n_shards),
+        num_workers=min(CPUS_PER_TASK, dataset.n_shards),
         pin_memory=True,
         drop_last=True,
         collate_fn=collator,
         prefetch_factor=2
     )
-    if validation_dataset:
-        validation_loader = DataLoader(
-            validation_dataset,
-            batch_size=batch_size,
-            num_workers=min(CPUS_PER_TASK, validation_dataset.n_shards),
-            pin_memory=True,
-            drop_last=False,
-            collate_fn=collator,
-            prefetch_factor=2
-        )
-        printmaster(f"Validation loader prefetch factor: {validation_loader.prefetch_factor}, num_workers: {validation_loader.num_workers}")
-    else:
-        validation_loader = None
-    return train_loader, validation_loader
+    return dataloader
 
 
-def get_dataloaders(args: argparse.Namespace, vocab: GeneVocab) -> Tuple[DataLoader, DataLoader]:
-    """
-    Get the dataloaders for training and validation datasets.
-    """
-    train_dataset, validation_dataset = create_datasets(args=args)
-    collator = create_collator(
-        vocab=vocab,
-        max_seq_len=args.max_seq_len,
-        pad_token=args.pad_token,
-        pad_value=args.pad_value,
-        input_style=args.input_style,
-        mask_ratio=args.mask_ratio,
-        mask_value=args.mask_value,
-        trunc_by_sample=args.trunc_by_sample,
-        training_tasks=args.training_tasks,
-    )
-    train_loader, validation_loader = create_dataloaders(train_dataset, validation_dataset, args.batch_size, collator)
+def get_train_loader(args: argparse.Namespace, vocab: GeneVocab, epoch: int) -> DataLoader:
+    dataset = create_train_dataset(args, epoch)
+    collator = create_collator(args=args, vocab=vocab)
+    dataloader = create_dataloader(dataset, collator, args.batch_size)
     dist.barrier()
     time.sleep(2)
-    return train_loader, validation_loader
+    return dataloader
+
+
+def get_validation_loader(args: argparse.Namespace, vocab: GeneVocab) -> DataLoader:
+    dataset = create_validation_dataset(args)
+    collator = create_collator(args=args, vocab=vocab)
+    dataloader = create_dataloader(dataset, collator, args.batch_size)
+    printmaster(f"Validation loader prefetch factor: {dataloader.prefetch_factor}, num_workers: {dataloader.num_workers}")
+    dist.barrier()
+    time.sleep(2)
+    return dataloader
+
+
+def create_collator(
+        args: argparse.Namespace,
+        vocab: GeneVocab
+    ) -> scg.DataCollator:
+    """
+    Create a data collator for the dataloader with provided arguments.
+    """
+    collator = scg.DataCollator(
+        do_padding=True if args.max_seq_len is not None else False,
+        pad_token_id=vocab[args.pad_token],
+        pad_value=args.pad_value,
+        do_mlm=True,
+        do_binning=True if args.input_style == "binned" else False,
+        mlm_probability=args.mask_ratio,
+        mask_value=args.mask_value,
+        max_length=args.max_seq_len,
+        sampling=args.trunc_by_sample,
+        data_style=args.training_tasks,
+    )
+    return collator
+
+
+# def create_dataloaders(train_dataset: Dataset, validation_dataset: Dataset, batch_size: int, collator: scg.DataCollator) -> Tuple[DataLoader, DataLoader]:
+#     """
+#     Get the dataloaders for training and validation datasets.
+#     Uses DistributedSampler for the training loader and uses the full validation dataset for the validation loader.
+#     """
+#     train_loader = DataLoader(
+#         train_dataset,
+#         batch_size=batch_size,
+#         num_workers=min(CPUS_PER_TASK, train_dataset.n_shards),
+#         pin_memory=True,
+#         drop_last=True,
+#         collate_fn=collator,
+#         prefetch_factor=2
+#     )
+#     if validation_dataset:
+#         validation_loader = DataLoader(
+#             validation_dataset,
+#             batch_size=batch_size,
+#             num_workers=min(CPUS_PER_TASK, validation_dataset.n_shards),
+#             pin_memory=True,
+#             drop_last=False,
+#             collate_fn=collator,
+#             prefetch_factor=2
+#         )
+#         printmaster(f"Validation loader prefetch factor: {validation_loader.prefetch_factor}, num_workers: {validation_loader.num_workers}")
+#     else:
+#         validation_loader = None
+#     return train_loader, validation_loader
+
+
+# def get_dataloaders(args: argparse.Namespace, vocab: GeneVocab) -> Tuple[DataLoader, DataLoader]:
+#     """
+#     Get the dataloaders for training and validation datasets.
+#     """
+#     train_dataset, validation_dataset = create_datasets(args=args)
+#     collator = create_collator(
+#         vocab=vocab,
+#         max_seq_len=args.max_seq_len,
+#         pad_token=args.pad_token,
+#         pad_value=args.pad_value,
+#         input_style=args.input_style,
+#         mask_ratio=args.mask_ratio,
+#         mask_value=args.mask_value,
+#         trunc_by_sample=args.trunc_by_sample,
+#         training_tasks=args.training_tasks,
+#     )
+#     train_loader, validation_loader = create_dataloaders(train_dataset, validation_dataset, args.batch_size, collator)
+#     dist.barrier()
+#     time.sleep(2)
+#     return train_loader, validation_loader
 
 
 
@@ -385,14 +460,14 @@ def get_model(args: argparse.Namespace, vocab: GeneVocab) -> DDP:
     return ddp_model
 
 
-def get_scheduler(args: argparse.Namespace, train_loader: DataLoader, optimizer: torch.optim.Optimizer) -> transformers.get_scheduler:
+def get_scheduler(args: argparse.Namespace, optimizer: torch.optim.Optimizer) -> transformers.get_scheduler:
     """
     Get the learning rate scheduler.
     """
     if args.warmup_ratio_or_steps > 0:
         if args.train_paths is None:
             raise ValueError("data_paths must be provided for streaming datasets")
-        total_num_batches = get_total_batch_count_per_GPU(args.train_paths, train_loader.batch_size) * args.epochs
+        total_num_batches = get_total_batch_count_per_GPU(args.train_paths, args.batch_size) * args.epochs
         warmup_steps = (
             int(total_num_batches * args.warmup_ratio_or_steps)
             if args.warmup_ratio_or_steps < 1
@@ -466,8 +541,8 @@ def load_checkpoint(
 def pretrain(
         args: argparse.Namespace,
         model: DDP,
-        train_loader: DataLoader,
-        validation_loader: DataLoader,
+        # train_loader: DataLoader,
+        # validation_loader: DataLoader,
         criterion: nn.Module,
         optimizer: torch.optim.Optimizer,
         scheduler: transformers.get_scheduler,
@@ -489,12 +564,14 @@ def pretrain(
     global_iter, epoch_offset, batch_offset = 0, 0, 0
     if args.checkpoint_dir is not None:
         global_iter, epoch_offset, batch_offset = load_checkpoint(args.checkpoint_dir, model, device, optimizer, scaler, scheduler)
+    validation_loader = get_validation_loader(args, vocab)
     for epoch in range(args.epochs):
         model.train()
         if epoch < epoch_offset:
-            printmaster(f"Skipping epoch {epoch+1} due to continue training from epoch {epoch_offset+1}")
+            printmaster(f"Skipping epoch {epoch+1} due to continue training from epoch {epoch_offset}")
             continue
         printmaster(f"Starting epoch {epoch+1}/{args.epochs}")
+        train_loader = get_train_loader(args, vocab, epoch)
 
         if args.shuffle_buffer_size > 0:
             if hasattr(train_loader, "dataset") and hasattr(train_loader.dataset, "set_epoch"):
@@ -651,29 +728,30 @@ def eval_and_save(args, model, train_loader, validation_loader, criterion, optim
         mask_value=args.mask_value,
         criterion=criterion,
     )
-    writer.add_scalar("validation/mse", val_mse, global_iter)
-    writer.add_scalar("validation/mre", val_mre, global_iter)
-    saved = False
-    if val_mse < best_val_mse:
-        best_val_mse = val_mse
-        if is_master_gpu():
-            torch.save(
-                            model.state_dict(),
-                            SAVE_DIR / "best_model_mse.pt",
-                        )
-            saved = True
-            
-    total_time_elapsed = time.time() - training_start_time
-    delta_time_elapsed = time.time() - delta_training_time
-    delta_training_time = time.time()
-    printlogging(
-        f"Epoch {epoch+1:2d} | Iter {i+1:5d} | "
-        f"MSE: {val_mse:4.4f} | "
-        f"MRE: {val_mre:4.4f} | "
-        f"Saved: {saved} | "
-        f"Total Time: {str(timedelta(seconds=int(total_time_elapsed)))} | "
-        f"Delta Time: {str(timedelta(seconds=int(delta_time_elapsed)))}",
-        level="validation"
+    if is_master_gpu():
+        writer.add_scalar("validation/mse", val_mse, global_iter)
+        writer.add_scalar("validation/mre", val_mre, global_iter)
+        saved = False
+        if val_mse < best_val_mse:
+            best_val_mse = val_mse
+            if is_master_gpu():
+                torch.save(
+                    model.state_dict(),
+                    SAVE_DIR / "best_model_mse.pt",
+                )
+                saved = True
+                
+        total_time_elapsed = time.time() - training_start_time
+        delta_time_elapsed = time.time() - delta_training_time
+        delta_training_time = time.time()
+        printlogging(
+            f"Epoch {epoch+1:2d} | Iter {i+1:5d} | "
+            f"MSE: {val_mse:4.4f} | "
+            f"MRE: {val_mre:4.4f} | "
+            f"Saved: {saved} | "
+            f"Total Time: {str(timedelta(seconds=int(total_time_elapsed)))} | "
+            f"Delta Time: {str(timedelta(seconds=int(delta_time_elapsed)))}",
+            level="validation"
     )
     # if SEPARATE_LOG_FILES:
     #     printgpu(
@@ -681,7 +759,7 @@ def eval_and_save(args, model, train_loader, validation_loader, criterion, optim
     #         f"Loss: {val_mse:12.4f} | "
     #         f"Saved: {saved}"
     #     )
-    if is_master_gpu():
+    # if is_master_gpu():
         state_dict = {
             "epoch": epoch,
             "batch_idx": i,
@@ -893,7 +971,7 @@ def main():
         # Load data
         vocab = get_vocabulary(Path(args.vocab_path))
         dump_vocab(vocab)
-        train_loader, validation_loader = get_dataloaders(args=args, vocab=vocab)
+        # train_loader, validation_loader = get_dataloaders(args=args, vocab=vocab)
         dist.barrier()
         time.sleep(2)
         # Initialize model, criterion, optimizer, scheduler
@@ -903,7 +981,6 @@ def main():
         scheduler = get_scheduler(
             args=args,
             optimizer=optimizer,
-            train_loader=train_loader,
         )
         dist.barrier()
         time.sleep(2)
@@ -911,8 +988,8 @@ def main():
         pretrain(
             args=args,
             model=ddp_model,
-            train_loader=train_loader,
-            validation_loader=validation_loader,
+            # train_loader=train_loader,
+            # validation_loader=validation_loader,
             criterion=criterion,
             optimizer=optimizer,
             scheduler=scheduler,
