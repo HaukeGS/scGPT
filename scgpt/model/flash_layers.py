@@ -14,7 +14,7 @@ from flash_attn.bert_padding import unpad_input, pad_input
 from flash_attn.flash_attention import FlashAttention
 from flash_attn.modules.mha import FlashCrossAttention
 from .layers import MultiheadAttention
-
+from .moe import MoE
 
 class FlashscGPTMHA(nn.Module):
     """
@@ -238,6 +238,8 @@ class FlashscGPTLayer(nn.Module):
             **factory_kwargs,
         )
         # Implementation of Feedforward model
+        self.moe = MoE(input_size=d_model, output_size=d_model, num_experts=8, hidden_size=dim_feedforward, k=2, noisy_gating=True)
+        self.moe = self.moe.to(device)
         self.linear1 = nn.Linear(d_model, dim_feedforward, **factory_kwargs)
         self.dropout = nn.Dropout(dropout)
         self.linear2 = nn.Linear(dim_feedforward, d_model, **factory_kwargs)
@@ -332,22 +334,24 @@ class FlashscGPTLayer(nn.Module):
                 pcpt_key_padding_mask=pcpt_key_padding_mask_,
                 gen_key_padding_mask=gen_key_padding_mask_,
             )[0]
-            pcpt_total_embs = pcpt_total_embs + self.dropout1(pcpt_total_embs2)
-            pcpt_total_embs = self.norm1(pcpt_total_embs)
-            pcpt_total_embs2 = self.linear2(
-                self.dropout(self.activation(self.linear1(pcpt_total_embs)))
-            )
-            pcpt_total_embs = pcpt_total_embs + self.dropout2(pcpt_total_embs2)
-            pcpt_total_embs = self.norm2(pcpt_total_embs)
+            pcpt_total_embs = self.moe(pcpt_total_embs2)
+            # pcpt_total_embs = pcpt_total_embs + self.dropout1(pcpt_total_embs2)
+            # pcpt_total_embs = self.norm1(pcpt_total_embs)
+            # pcpt_total_embs2 = self.linear2(
+            #     self.dropout(self.activation(self.linear1(pcpt_total_embs)))
+            # )
+            # pcpt_total_embs = pcpt_total_embs + self.dropout2(pcpt_total_embs2)
+            # pcpt_total_embs = self.norm2(pcpt_total_embs)
 
             if gen_total_embs is not None:
-                gen_total_embs = gen_total_embs + self.dropout1(gen_total_embs2)
-                gen_total_embs = self.norm1(gen_total_embs)
-                gen_total_embs2 = self.linear2(
-                    self.dropout(self.activation(self.linear1(gen_total_embs)))
-                )
-                gen_total_embs = gen_total_embs + self.dropout2(gen_total_embs2)
-                gen_total_embs = self.norm2(gen_total_embs)
+                gen_total_embs = self.moe(gen_total_embs2)
+                # gen_total_embs = gen_total_embs + self.dropout1(gen_total_embs2)
+                # gen_total_embs = self.norm1(gen_total_embs)
+                # gen_total_embs2 = self.linear2(
+                #     self.dropout(self.activation(self.linear1(gen_total_embs)))
+                # )
+                # gen_total_embs = gen_total_embs + self.dropout2(gen_total_embs2)
+                # gen_total_embs = self.norm2(gen_total_embs)
 
         return pcpt_total_embs, gen_total_embs
 
