@@ -79,7 +79,7 @@ fi
 #     DATA_SOURCES+=("/data/datasets/biology/scGPT-data/preprocessed/$TISSUE/all_counts/cls_prefix_data.parquet")
 # done
 
-srun python -u scGPT_distributed/pretrain_distributed_args.py \
+srun python -u /home/hauke.schuele/scGPT_distributed/pretrain_distributed_args.py \
     --tissues "${TISSUES[@]}" \
     --data-tissue-path "$DATA_TISSUE_PATH" \
     --epochs 2 \
