@@ -703,16 +703,16 @@ def log_training(args, scheduler, writer, training_start_time, delta_training_ti
         writer.add_scalar("loss/gen", running_loss_gen / args.log_interval, global_iter)
         writer.add_scalar("loss/total", running_loss_total / args.log_interval, global_iter)
         writer.add_scalar("lr", scheduler.get_last_lr()[0], global_iter)
-    # if SEPARATE_LOG_FILES:
-    #     total_time_elapsed = time.time() - total_training_time
-    #     delta_time_elapsed = time.time() - delta_training_time
-    #     delta_training_time = time.time()
-    #     printgpu(
-    #         f"Epoch {epoch+1:2d}/{args.epochs:2d} | Iter {i+1:5d}/{n_total_batches:5d} | "
-    #         f"Loss: {running_loss_total / args.log_interval:12.4f} | "
-    #         f"Total Time: {str(timedelta(seconds=int(total_time_elapsed)))} | "
-    #         f"Delta Time: {str(timedelta(seconds=int(delta_time_elapsed)))}"
-    #     )
+    if SEPARATE_LOG_FILES:
+        total_time_elapsed = time.time() - training_start_time
+        delta_time_elapsed = time.time() - delta_training_time
+        delta_training_time = time.time()
+        printgpu(
+            f"Epoch {epoch+1:2d}/{args.epochs:2d} | Iter {i+1:5d}/{n_total_batches:5d} | "
+            f"Loss: {running_loss_total / args.log_interval:12.4f} | "
+            f"Total Time: {str(timedelta(seconds=int(total_time_elapsed)))} | "
+            f"Delta Time: {str(timedelta(seconds=int(delta_time_elapsed)))}"
+        )
         return delta_training_time
     return 0
 
