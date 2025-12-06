@@ -291,7 +291,18 @@ def add_arguments(parser: argparse.ArgumentParser):
         help="The number of layers for the classification network, including the "
         "output layer. Default is 3.",
     )
-
+    parser.add_argument(
+        "--num-experts",
+        type=int,
+        default=0,
+        help="The number of experts for the Mixture of Experts layer. Default is 0, which means MoE is disabled.",
+    )
+    parser.add_argument(
+        "--k",
+        type=int,
+        default=0,
+        help="The number of experts to use in the MoE layer. Default is 0, which means MoE is disabled.",
+    )
     # settings for logging
     parser.add_argument(
         "--log-interval",

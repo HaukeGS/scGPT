@@ -454,6 +454,8 @@ def get_model(args: argparse.Namespace, vocab: GeneVocab) -> DDP:
         use_generative_training=USE_GENERATIVE_TRAINING,
         use_fast_transformer=args.fast_transformer,
         fast_transformer_backend="flash",
+        num_experts=args.num_experts,
+        k=args.k,
     ).to(LOCAL_RANK)
     ddp_model = DDP(model, device_ids=[LOCAL_RANK])
     printgpu(f"Model initialized with {sum(p.numel() for p in model.parameters() if p.requires_grad):_} trainable parameters")
@@ -578,6 +580,7 @@ def pretrain(
                 train_loader.dataset.set_epoch(epoch)
             elif i == 0:
                 printmaster("Warning: train_loader.dataset has no set_epoch method, shuffling may not be deterministic across epochs.")
+        
         running_loss_mse = 0.0
         running_loss_mvc = 0.0
         running_loss_gen = 0.0
@@ -600,7 +603,7 @@ def pretrain(
                 [printmaster(f"data_dict key: {k}, shape: {v.shape}") for k, v in data_dict.items()]
             
             with torch.cuda.amp.autocast(enabled=args.fp16):
-                output_dict = model(
+                output_dict, aux_loss1 = model(
                     pcpt_gene,
                     pcpt_expr,
                     pcpt_key_padding_mask,
@@ -626,9 +629,10 @@ def pretrain(
                 )
 
                 loss_gen = torch.tensor(0.0, device=device)
+                aux_loss2 = None
                 if global_iter > 1000:
                     previous_cell_embs = output_dict["cell_emb"].detach()
-                    preds = model(
+                    preds_dict, aux_loss2 = model(
                         pcpt_gene,
                         pcpt_expr,
                         pcpt_key_padding_mask,
@@ -638,10 +642,13 @@ def pretrain(
                         MVC=False,
                         input_cell_emb=previous_cell_embs,
                         generative_training=True,
-                    )["gen_preds"]
-                    loss_gen = criterion(preds, gen_expr_target, positions_to_match)
-
-                total_loss = loss_mse + loss_mvc + loss_gen
+                    )
+                    loss_gen = criterion(preds_dict['gen_preds'], gen_expr_target, positions_to_match)
+                if aux_loss1 is not None:
+                    aux_loss = aux_loss1 + aux_loss2 if aux_loss2 is not None else aux_loss1
+                    total_loss = loss_mse + loss_mvc + loss_gen + aux_loss
+                else:
+                    total_loss = loss_mse + loss_mvc + loss_gen
 
             if args.grad_accu_steps > 1:
                 total_loss = total_loss / args.grad_accu_steps
@@ -687,10 +694,17 @@ def pretrain(
 
 
 def log_training(args, scheduler, writer, training_start_time, delta_training_time, n_total_batches, global_iter, epoch, running_loss_mse, running_loss_mvc, running_loss_gen, running_loss_total, i):
+    total_time_elapsed = time.time() - training_start_time
+    delta_time_elapsed = time.time() - delta_training_time
+    delta_training_time = time.time()
+    if SEPARATE_LOG_FILES:
+        printgpu(
+            f"Epoch {epoch+1:2d}/{args.epochs:2d} | Iter {i+1:5d}/{n_total_batches:5d} | "
+            f"Loss: {running_loss_total / args.log_interval:12.4f} | "
+            f"Total Time: {str(timedelta(seconds=int(total_time_elapsed)))} | "
+            f"Delta Time: {str(timedelta(seconds=int(delta_time_elapsed)))}"
+        )
     if is_master_gpu():
-        total_time_elapsed = time.time() - training_start_time
-        delta_time_elapsed = time.time() - delta_training_time
-        delta_training_time = time.time()
         printlogging(
             f"Epoch {epoch+1:2d}/{args.epochs:2d} | Iter {i+1:5d}/{n_total_batches:5d} | "
             f"Loss: {running_loss_total / args.log_interval:12.4f} | "
@@ -703,16 +717,6 @@ def log_training(args, scheduler, writer, training_start_time, delta_training_ti
         writer.add_scalar("loss/gen", running_loss_gen / args.log_interval, global_iter)
         writer.add_scalar("loss/total", running_loss_total / args.log_interval, global_iter)
         writer.add_scalar("lr", scheduler.get_last_lr()[0], global_iter)
-    if SEPARATE_LOG_FILES:
-        total_time_elapsed = time.time() - training_start_time
-        delta_time_elapsed = time.time() - delta_training_time
-        delta_training_time = time.time()
-        printgpu(
-            f"Epoch {epoch+1:2d}/{args.epochs:2d} | Iter {i+1:5d}/{n_total_batches:5d} | "
-            f"Loss: {running_loss_total / args.log_interval:12.4f} | "
-            f"Total Time: {str(timedelta(seconds=int(total_time_elapsed)))} | "
-            f"Delta Time: {str(timedelta(seconds=int(delta_time_elapsed)))}"
-        )
         return delta_training_time
     return 0
 
