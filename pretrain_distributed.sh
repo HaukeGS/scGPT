@@ -10,7 +10,7 @@
 #SBATCH --partition=ampere
 #SBATCH --output=/home/hauke.schuele/scGPT_distributed/logs/%x-%j.out  # File to which STDOUT will be written
 #SBATCH --error=/home/hauke.schuele/scGPT_distributed/logs/%x-%j.err   # File to which STDERR will be written
-#SBATCH --time=20-00:00:00              # Time limit (hh:mm:ss) production time
+#SBATCH --time=10-00:00:00              # Time limit (hh:mm:ss) production time
 #SBATCH --mail-user=schuele.hauke@gmail.com
 #SBATCH --mail-type=ALL       # Type of email notification- BEGIN,END,FAIL,ALL
 echo ""
@@ -79,7 +79,7 @@ fi
 #     DATA_SOURCES+=("/data/datasets/biology/scGPT-data/preprocessed/$TISSUE/all_counts/cls_prefix_data.parquet")
 # done
 
-srun python -u scGPT_distributed/pretrain_distributed_args.py \
+srun python -u /home/hauke.schuele/scGPT_distributed/pretrain_distributed_args.py \
     --tissues "${TISSUES[@]}" \
     --data-tissue-path "$DATA_TISSUE_PATH" \
     --epochs 6 \
