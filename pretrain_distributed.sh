@@ -23,7 +23,7 @@ micromamba activate scgpt_manual
 # SLURM parameters
 master_address=$(scontrol show hostnames $SLURM_JOB_NODELIST | head -n 1)
 export MASTER_ADDR=$master_address
-export MASTER_PORT=$(((SLURM_JOB_ID % 100000) + 1024))
+export MASTER_PORT=$(((SLURM_JOB_ID % 65535) + 1024))
 export WORLD_SIZE=$(($SLURM_NNODES * $SLURM_NTASKS_PER_NODE))
 echo "MASTER_ADDR=$MASTER_ADDR"
 echo "MASTER_PORT=$MASTER_PORT"
@@ -33,8 +33,8 @@ echo "WORLD_SIZE=$WORLD_SIZE"
 
 
 # Script parameters
-streaming="true"
-interleaved="true"
+streaming="false"
+interleaved="false"
 
 # Tissue selection based on data percentage
 data_percentage="$1"
