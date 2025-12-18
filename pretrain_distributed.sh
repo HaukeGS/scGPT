@@ -3,14 +3,17 @@
 # See `man sbatch` or https://slurm.schedmd.com/sbatch.html for descriptions of sbatch options.
 #SBATCH --job-name=scGPT_pretrain              # Gets overwritten by run_and_monitor_job.sh!
 #SBATCH --nodes=1                                     # Number of nodes to request
-#SBATCH --ntasks-per-node=4                           # total number of tasks per node
+#SBATCH --ntasks-per-node=2                           # total number of tasks per node
 #SBATCH --cpus-per-task=4                             # Number of CPUs to request
-#SBATCH --gres=gpu:a100:4                             # Number of GPUs to request
+#SBATCH --gres=gpu:a100:2                             # Number of GPUs to request
 #SBATCH --mem-per-gpu=4GB
 #SBATCH --partition=standby
 #SBATCH --output=/home/hauke.schuele/scGPT_distributed/logs/%x-%j.out  # File to which STDOUT will be written
 #SBATCH --error=/home/hauke.schuele/scGPT_distributed/logs/%x-%j.err   # File to which STDERR will be written
-#SBATCH --time=10-00:00:00              # Time limit (hh:mm:ss) production time
+#SBATCH --time=00:20:00              # Time limit (hh:mm:ss) debug time
+echo ""
+#SBATCH --time=20-00:00:00              # Time limit (hh:mm:ss) production time
+
 #SBATCH --mail-user=schuele.hauke@gmail.com
 #SBATCH --mail-type=ALL       # Type of email notification- BEGIN,END,FAIL,ALL
 
@@ -21,7 +24,7 @@ micromamba activate scgpt_manual
 # SLURM parameters
 master_address=$(scontrol show hostnames $SLURM_JOB_NODELIST | head -n 1)
 export MASTER_ADDR=$master_address
-export MASTER_PORT=$(((SLURM_JOB_ID % 100000) + 1024))
+export MASTER_PORT=$(((SLURM_JOB_ID % 65535) + 1024))
 export WORLD_SIZE=$(($SLURM_NNODES * $SLURM_NTASKS_PER_NODE))
 echo "MASTER_ADDR=$MASTER_ADDR"
 echo "MASTER_PORT=$MASTER_PORT"
@@ -31,8 +34,8 @@ echo "WORLD_SIZE=$WORLD_SIZE"
 
 
 # Script parameters
-streaming="true"
-interleaved="true"
+streaming="false"
+interleaved="false"
 
 # Tissue selection based on data percentage
 data_percentage="$1"
@@ -56,6 +59,15 @@ elif [ "$data_percentage" = "100" ]; then
 fi
 IFS=$'\n' TISSUES=($(printf '%s\n' "${TISSUES[@]}" | sort))
 echo "Sorted tissues: ${TISSUES[@]}"
+
+if [ "$2" = "moe" ]; then
+    echo "MOE training enabled."
+    NUM_EXPERTS=8
+    K=2
+else
+    NUM_EXPERTS=0
+    K=0
+fi
 
 
 # Data paths
@@ -94,14 +106,14 @@ srun python -u /home/hauke.schuele/scGPT_distributed/pretrain_distributed_args.p
     --fp16 \
     --streaming "$streaming" \
     --interleaved "$interleaved" \
+    --separate-gpu-log-files \
     --lr 0.0001 \
     --warmup-ratio-or-steps 10000 \
-    --nlayers 12 \
-    --nheads 8 \
-    --embsize 512 \
-    --d-hid 512 \
-    --shuffle-buffer-size 0 \
-    --separate-gpu-log-files \
-    --num-experts 8 \
-    --k 2 \
+    --num-experts $NUM_EXPERTS \
+    --k $K \
+    # --nlayers 12 \
+    # --nheads 8 \
+    # --embsize 512 \
+    # --d-hid 512 \
+    # --shuffle-buffer-size 0 \
     # --checkpoint-dir "/home/hauke.schuele/save/pretrain-distributed-[257990]-2025-11-18_00-27-20" \

@@ -37,7 +37,7 @@ def add_arguments(parser: argparse.ArgumentParser):
     parser.add_argument(
         "--cache-dir",
         type=str,
-        default=None,
+        default="/home/hauke.schuele/datasets_cache",
         help="The directory to use for caching streaming datasets. If not provided, a 'cache' subdirectory will be created in the same directory as the data files.",
     )
      # settings for saving and loading models
@@ -124,7 +124,7 @@ def add_arguments(parser: argparse.ArgumentParser):
         "--max-seq-len",
         type=int,
         default=1200,
-        help="The maximum length of the sequence. Default is 1000. The actual used "
+        help="The maximum length of the sequence. Default is 1200. The actual used "
         "max length would be the minimum of this value and the length of the longest "
         "sequence in the data.",
     )
