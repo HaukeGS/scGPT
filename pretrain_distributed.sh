@@ -13,6 +13,7 @@
 #SBATCH --time=00:20:00              # Time limit (hh:mm:ss) debug time
 echo ""
 #SBATCH --time=20-00:00:00              # Time limit (hh:mm:ss) production time
+
 #SBATCH --mail-user=schuele.hauke@gmail.com
 #SBATCH --mail-type=ALL       # Type of email notification- BEGIN,END,FAIL,ALL
 
