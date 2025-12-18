@@ -54,6 +54,8 @@ class TransformerModel(nn.Module):
         fast_transformer_backend: str = "flash",
         pre_norm: bool = False,
         use_sim_decoder: bool = False,
+        num_experts: Optional[int] = None,
+        k: Optional[int] = None,
     ):
         super().__init__()
         self.model_type = "Transformer"
@@ -114,6 +116,8 @@ class TransformerModel(nn.Module):
                 dropout,
                 batch_first=True,
                 norm_scheme=self.norm_scheme,
+                num_experts=num_experts,
+                k=k,
             )
             self.transformer_encoder = FlashscGPTGenerator(encoder_layers, nlayers)
         elif use_fast_transformer:
@@ -256,14 +260,14 @@ class TransformerModel(nn.Module):
         if input_cell_emb is not None:
             pcpt_total_embs[:, 0, :] = input_cell_emb
 
-        pcpt_output, gen_output = self.transformer_encoder(
+        pcpt_output, gen_output, aux_loss = self.transformer_encoder(
             pcpt_total_embs,
             gen_total_embs,
             pcpt_key_padding_mask=pcpt_key_padding_mask,
             gen_key_padding_mask=gen_key_padding_mask,
         )
 
-        return pcpt_output, gen_output
+        return pcpt_output, gen_output, aux_loss
 
     def _get_cell_emb_from_layer(
         self, layer_output: Tensor, weights: Tensor = None
@@ -494,7 +498,7 @@ class TransformerModel(nn.Module):
                     embsize]
         """
 
-        pcpt_output, gen_output = self.transformer_generate(
+        pcpt_output, gen_output, aux_loss = self.transformer_generate(
             pcpt_genes,
             pcpt_values,
             pcpt_key_padding_mask,
@@ -549,7 +553,7 @@ class TransformerModel(nn.Module):
             do_sample=do_sample,
         )
 
-        return output
+        return output, aux_loss
 
     def perceptual_forward(
         self,
@@ -889,6 +893,7 @@ class FlashTransformerEncoderLayer(nn.Module):
             src2 = self.linear2(self.dropout(self.activation(self.linear1(src))))
             src = src + self.dropout2(src2)
         else:
+            print(f"This is used")
             src2 = self.self_attn(src, key_padding_mask=src_key_padding_mask_)[0]
             src = src + self.dropout1(src2)
             src = self.norm1(src)
