@@ -1,18 +1,19 @@
 #!/bin/bash
 
 # See `man sbatch` or https://slurm.schedmd.com/sbatch.html for descriptions of sbatch options.
-#SBATCH --job-name=scGPT_pretrain              # Gets overwritten by run_and_monitor_job.sh!
+#SBATCH --job-name=scGPT_original              # Gets overwritten by run_and_monitor_job.sh!
 #SBATCH --nodes=1                                     # Number of nodes to request
-#SBATCH --ntasks-per-node=2                           # total number of tasks per node
+#SBATCH --ntasks-per-node=8                           # total number of tasks per node
 #SBATCH --cpus-per-task=4                             # Number of CPUs to request
-#SBATCH --gres=gpu:a100:2                             # Number of GPUs to request
-#SBATCH --mem-per-gpu=4GB
-#SBATCH --partition=standby
+#SBATCH --gres=gpu:a100:8                             # Number of GPUs to request
+#SBATCH --mem-per-gpu=16GB
+#SBATCH --partition=ampere
 #SBATCH --output=/home/hauke.schuele/scGPT_distributed/logs/%x-%j.out  # File to which STDOUT will be written
 #SBATCH --error=/home/hauke.schuele/scGPT_distributed/logs/%x-%j.err   # File to which STDERR will be written
-#SBATCH --time=00:20:00              # Time limit (hh:mm:ss) debug time
+#SBATCH --time=10-00:00:00              # Time limit (hh:mm:ss) production time
 echo ""
-#SBATCH --time=20-00:00:00              # Time limit (hh:mm:ss) production time
+#SBATCH --nodelist=gpunode06
+#SBATCH --time=02:00:00              # Time limit (hh:mm:ss) debug time
 
 #SBATCH --mail-user=schuele.hauke@gmail.com
 #SBATCH --mail-type=ALL       # Type of email notification- BEGIN,END,FAIL,ALL
@@ -23,8 +24,11 @@ micromamba activate scgpt_manual
 
 # SLURM parameters
 master_address=$(scontrol show hostnames $SLURM_JOB_NODELIST | head -n 1)
+# master_port=$(id -u)
 export MASTER_ADDR=$master_address
-export MASTER_PORT=$(((SLURM_JOB_ID % 65535) + 1024))
+# export MASTER_PORT=$master_port
+# export MASTER_PORT=51550
+export MASTER_PORT=$(((SLURM_JOB_ID % 10000) + 50000))
 export WORLD_SIZE=$(($SLURM_NNODES * $SLURM_NTASKS_PER_NODE))
 echo "MASTER_ADDR=$MASTER_ADDR"
 echo "MASTER_PORT=$MASTER_PORT"
@@ -42,8 +46,8 @@ data_percentage="$1"
 if [ -z "$data_percentage" ]; then
     echo "No data percentage provided. Using default: 10%"
     data_percentage="10"
-elif [ "$data_percentage" != "10" ] && [ "$data_percentage" != "50" ] && [ "$data_percentage" != "100" ]; then
-    echo "Invalid data percentage provided: $data_percentage. Allowed values are 10, 50, or 100."
+elif [ "$data_percentage" != "10" ] && [ "$data_percentage" != "50" ] && [ "$data_percentage" != "100" ] && [ "$data_percentage" != "lung" ]; then
+    echo "Invalid data percentage provided: $data_percentage. Allowed values are 10, 50, 100, or lung."
     echo "Using default: 10%"
     data_percentage="10"
 else
@@ -53,9 +57,11 @@ fi
 if [ "$data_percentage" = "10" ]; then
     TISSUES=("heart" "lung")
 elif [ "$data_percentage" = "50" ]; then
-    TISSUES=("lung" "others" "pan-cancer")
+    TISSUES=("lung" "others" "pancreas")
 elif [ "$data_percentage" = "100" ]; then
-    TISSUES=("blood" "brain" "heart" "intestine" "kidney" "lung" "others" "pan-cancer" "pancreas")
+    TISSUES=("blood" "brain" "heart" "intestine" "kidney" "lung" "others" "pancreas")
+elif [ "$data_percentage" = "lung" ]; then
+    TISSUES=("lung")
 fi
 IFS=$'\n' TISSUES=($(printf '%s\n' "${TISSUES[@]}" | sort))
 echo "Sorted tissues: ${TISSUES[@]}"
@@ -64,9 +70,11 @@ if [ "$2" = "moe" ]; then
     echo "MOE training enabled."
     NUM_EXPERTS=8
     K=2
+    BATCH_SIZE=13
 else
     NUM_EXPERTS=0
     K=0
+    BATCH_SIZE=19
 fi
 
 
@@ -79,27 +87,25 @@ else
         # echo "Using streaming with non-interleaved data is no more supported. Exiting."
         # exit 1
     else
-        DATA_TISSUE_PATH="/home/hauke.schuele/cellxgene_data/"
+        DATA_TISSUE_PATH="/home/hauke.schuele/cellxgene_data_2023-05-15/"
     fi
 fi
 
-# DATA_SOURCES=()
 
-# for TISSUE in "${TISSUES[@]}"; do
-#     DATA_SOURCES+=("/data/datasets/biology/scGPT-data/preprocessed/$TISSUE/all_counts/cls_prefix_data.parquet")
-# done
+# Batch size: 20 for normal, 13 for moe with e=8, k=2
+
 
 srun python -u /home/hauke.schuele/scGPT_distributed/pretrain_distributed_args.py \
     --tissues "${TISSUES[@]}" \
     --data-tissue-path "$DATA_TISSUE_PATH" \
     --epochs 6 \
     --training-tasks "both" \
-    --save-dir ./save/pretrain-distributed-[$SLURM_JOB_ID]-$(date +%Y-%m-%d_%H-%M-%S) \
-    --vocab-path "/data/datasets/biology/scGPT-data/preprocessed/default_census_vocab.json" \
+    --save-dir "/home/hauke.schuele/save/pretrain-distributed-[$SLURM_JOB_ID]-$(date +%Y-%m-%d_%H-%M-%S)" \
+    --vocab-path "/home/hauke.schuele/cellxgene_data_2023-05-15/2023-05-15-vocab.json" \
     --save-interval 50000 \
     --log-interval 1000 \
-    --batch-size 14  \
-    --valid-ratio 0.04 \
+    --batch-size $BATCH_SIZE  \
+    --valid-ratio 0.003 \
     --trunc-by-sample \
     --no-cls \
     --no-cce \
@@ -111,9 +117,9 @@ srun python -u /home/hauke.schuele/scGPT_distributed/pretrain_distributed_args.p
     --warmup-ratio-or-steps 10000 \
     --num-experts $NUM_EXPERTS \
     --k $K \
-    # --nlayers 12 \
-    # --nheads 8 \
-    # --embsize 512 \
-    # --d-hid 512 \
+    --nlayers 12 \
+    --nheads 8 \
+    --embsize 512 \
+    --d-hid 512 \
     # --shuffle-buffer-size 0 \
     # --checkpoint-dir "/home/hauke.schuele/save/pretrain-distributed-[257990]-2025-11-18_00-27-20" \

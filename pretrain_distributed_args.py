@@ -600,7 +600,7 @@ def pretrain(
                 1.0,
             )  # gradient clipping
             if not math.isfinite(total_loss):
-                print(f"Non-finite loss detected: {total_loss.item()} at epoch {epoch}, batch {i}. Skipping batch and continuing training.")
+                printgpu(f"Non-finite loss detected: {total_loss.item()} at epoch {epoch}, batch {i}. Skipping batch and continuing training.")
                 continue
             scaler.step(optimizer)
             scaler.update()
@@ -616,15 +616,16 @@ def pretrain(
             running_loss_gen += loss_gen.item()
             running_loss_total += total_loss.item()
             if ((i+1) % args.log_interval == 0):
-                delta_training_time = log_training(args, scheduler, writer, training_start_time, delta_training_time, n_total_batches, global_iter, epoch, running_loss_mse, running_loss_mvc, running_loss_gen, running_loss_total, i)
+                delta_training_time = log_training(args, scheduler, writer, training_start_time, delta_training_time, n_total_batches, global_iter, epoch, running_loss_mse, running_loss_mvc, running_loss_gen, running_loss_total, i, args.log_interval)
                 running_loss_mse, running_loss_mvc, running_loss_gen, running_loss_total = 0.0, 0.0, 0.0, 0.0
 
             if ((i+1) % args.save_interval == 0) and validation_loader is not None:
                 best_val_mse, delta_training_time = eval_and_save(args, model, train_loader, validation_loader, criterion, optimizer, scheduler, device, vocab, scaler, best_val_mse, writer, training_start_time, delta_training_time, global_iter, epoch, i)
+                model.train()
             global_iter += 1
             dist.barrier()
 
-        delta_training_time = log_training(args, scheduler, writer, training_start_time, delta_training_time, n_total_batches, global_iter, epoch, running_loss_mse, running_loss_mvc, running_loss_gen, running_loss_total, i)
+        delta_training_time = log_training(args, scheduler, writer, training_start_time, delta_training_time, n_total_batches, global_iter, epoch, running_loss_mse, running_loss_mvc, running_loss_gen, running_loss_total, i, ((i+1) % args.log_interval))
         running_loss_mse, running_loss_mvc, running_loss_gen, running_loss_total = 0.0, 0.0, 0.0, 0.0
         if validation_loader is not None:
             best_val_mse, delta_training_time = eval_and_save(args, model, train_loader, validation_loader, criterion, optimizer, scheduler, device, vocab, scaler, best_val_mse, writer, training_start_time, delta_training_time, global_iter, epoch+1, 0)
@@ -633,29 +634,29 @@ def pretrain(
     printmaster("Training complete.")
 
 
-def log_training(args, scheduler, writer, training_start_time, delta_training_time, n_total_batches, global_iter, epoch, running_loss_mse, running_loss_mvc, running_loss_gen, running_loss_total, i):
+def log_training(args, scheduler, writer, training_start_time, delta_training_time, n_total_batches, global_iter, epoch, running_loss_mse, running_loss_mvc, running_loss_gen, running_loss_total, i, denominator):
     total_time_elapsed = time.time() - training_start_time
     delta_time_elapsed = time.time() - delta_training_time
     delta_training_time = time.time()
     if SEPARATE_LOG_FILES:
         printgpu(
             f"Epoch {epoch+1:2d}/{args.epochs:2d} | Iter {i+1:5d}/{n_total_batches:5d} | "
-            f"Loss: {running_loss_total / args.log_interval:12.4f} | "
+            f"Loss: {running_loss_total / denominator:12.4f} | "
             f"Total Time: {str(timedelta(seconds=int(total_time_elapsed)))} | "
             f"Delta Time: {str(timedelta(seconds=int(delta_time_elapsed)))}"
         )
     if is_master_gpu():
         printlogging(
             f"Epoch {epoch+1:2d}/{args.epochs:2d} | Iter {i+1:5d}/{n_total_batches:5d} | "
-            f"Loss: {running_loss_total / args.log_interval:12.4f} | "
+            f"Loss: {running_loss_total / denominator:12.4f} | "
             f"Total Time: {str(timedelta(seconds=int(total_time_elapsed)))} | "
             f"Delta Time: {str(timedelta(seconds=int(delta_time_elapsed)))}",
             level="training"
         )
-        writer.add_scalar("loss/mse", running_loss_mse / args.log_interval, global_iter)
-        writer.add_scalar("loss/mvc", running_loss_mvc / args.log_interval, global_iter)
-        writer.add_scalar("loss/gen", running_loss_gen / args.log_interval, global_iter)
-        writer.add_scalar("loss/total", running_loss_total / args.log_interval, global_iter)
+        writer.add_scalar("loss/mse", running_loss_mse / denominator, global_iter)
+        writer.add_scalar("loss/mvc", running_loss_mvc / denominator, global_iter)
+        writer.add_scalar("loss/gen", running_loss_gen / denominator, global_iter)
+        writer.add_scalar("loss/total", running_loss_total / denominator, global_iter)
         writer.add_scalar("lr", scheduler.get_last_lr()[0], global_iter)
         return delta_training_time
     return 0
@@ -754,7 +755,7 @@ def evaluate(
             gen_key_padding_mask = gen_gene.eq(vocab[pad_token])
 
             with torch.cuda.amp.autocast(enabled=fp16_enabled):
-                output_dict = model(
+                output_dict, _ = model(
                     pcpt_gene,
                     pcpt_expr,
                     pcpt_key_padding_mask,
@@ -789,7 +790,7 @@ def evaluate(
         global_mre = total_mre.item() / total_count.item()
     else:
         raise ValueError("Distributed not initialized")
-    
+    model.train()
     return global_mse, global_mre
 
 
@@ -801,15 +802,19 @@ def setup_distributeddataparallel():
     Setup the DistributedDataParallel (DDP) environment.
     """
     try:
-        dist.init_process_group("nccl", rank=GLOBAL_RANK, world_size=WORLD_SIZE)
-        
-        # Test communication with a barrier
+        printmaster(f"Setting up DistributedDataParallel with WORLD_SIZE={WORLD_SIZE}, MASTER_ADDR={os.environ['MASTER_ADDR']}, MASTER_PORT={os.environ['MASTER_PORT']}")
+        dist.init_process_group("nccl", rank=GLOBAL_RANK, world_size=WORLD_SIZE)        
         dist.barrier()
-        printgpu(f"Successfully synchronized with all processes")
+        
+        # Now safe to use printgpu with file I/O
+        printgpu(f"DDP setup complete, communication verified")
+        printmaster(f"All {WORLD_SIZE} processes successfully initialized and synchronized")
         
     except Exception as e:
-        printgpu(f"Failed in setup: {e}")
-        raise
+        print(f"[Rank {GLOBAL_RANK}] EXCEPTION in setup: {e}", flush=True)
+        import traceback
+        traceback.print_exc()
+        sys.exit(1)
 
 
 def initialize_slurm_variables():
