@@ -195,6 +195,8 @@ class DataBank:
             data_keys=[main_table_key],
             token_col=token_col,
         )[0]
+        # print(f"data_table type: {type(data_table)}")
+        # print(f"data_table.data type: {type(data_table.data)}, size: {len(data_table.data)}")
         # update and immediate save
         db.main_table_key = main_table_key
         db.update_datatables(new_tables=[data_table], immediate_save=immediate_save)
@@ -285,11 +287,27 @@ class DataBank:
             data = adata.layers[data_key]
         elif data_key in adata.obsm:
             data = adata.obsm[data_key]
+        elif data_key in adata.obs:
+            data = adata.obs[data_key]
+            return Dataset.from_dict({f"{data_key}": data.tolist()})
         else:
             logger.warning(f"Data key {data_key} not found, skip loading.")
             return None
 
         tokenized_data = self._tokenize(data, index_map)
+        try:
+            if len(tokenized_data["id"]) == len(adata.obs['soma_joinid']):
+                tokenized_data["soma_joinid"] = adata.obs['soma_joinid'].tolist()
+            else:
+                print(f"!!!Warning: length of tokenized data {len(tokenized_data['id'])} does not match length of adata.obs['soma_joinid'] {len(adata.obs['soma_joinid'])}, skip loading soma_joinid.")
+            if len(tokenized_data["id"]) == len(adata.obs['cell_type']):
+                tokenized_data["cell_type"] = adata.obs['cell_type'].tolist()
+            else:
+                print(f"!!!Warning: length of tokenized data {len(tokenized_data['id'])} does not match length of adata.obs['cell_type'] {len(adata.obs['cell_type'])}, skip loading cell_type.")
+        except KeyError:
+            print(f"!!!Warning: adata.obs does not contain soma_joinid or cell_type, skip loading them.")
+        dataset = Dataset.from_dict(tokenized_data)
+        print(f"!!!Loaded data key {data_key} with {len(dataset)} rows and columns: {dataset.column_names}.")
 
         return Dataset.from_dict(tokenized_data)
 
@@ -319,7 +337,7 @@ class DataBank:
             Dict[str, List]: Tokenized data.
         """
         if not isinstance(data, (np.ndarray, csr_matrix)):
-            raise ValueError("data must be a numpy array or sparse matrix.")
+            raise ValueError(f"data {data} must be a numpy array or sparse matrix, but was {type(data)}.")
 
         if isinstance(data, np.ndarray):
             zero_ratio = np.sum(data == 0) / data.size
@@ -723,6 +741,7 @@ def _nparray2mapped_values(
     Returns:
         Dict[str, List]: Mapping from column name to list of values.
     """
+    print(f"Using function _nparray2mapped_values with mode {mode}")
     if mode == "plain":
         convert_func = _nparray2indexed_values
     elif mode == "numba":
