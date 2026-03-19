@@ -523,6 +523,7 @@ def pretrain(
         
         running_loss_mse = 0.0
         running_loss_mvc = 0.0
+        running_loss_aux = 0.0
         running_loss_gen = 0.0
         running_loss_total = 0.0
 
@@ -536,6 +537,10 @@ def pretrain(
             pcpt_expr = data_dict["pcpt_expr"].to(device)
             gen_gene = data_dict["gen_gene"].to(device)
             gen_expr_target = data_dict["gen_expr_target"].to(device)
+            if args.cell_type_vocab_path is not None:
+                cell_type_ids = data_dict.get("cell_type_id", None)
+                cell_type_ids = cell_type_ids.to(device) if cell_type_ids is not None else None
+                print(f"cell_type_ids.shape: {cell_type_ids.shape}" if cell_type_ids is not None else "cell_type_ids is None")
             pcpt_key_padding_mask = pcpt_gene.eq(vocab[args.pad_token])
             gen_key_padding_mask = gen_gene.eq(vocab[args.pad_token])
 
@@ -552,6 +557,7 @@ def pretrain(
                     CLS=USE_CLS,
                     MVC=MVC,
                     generative_training=True,
+                    cell_type_ids=cell_type_ids
                 )
                 if i == 0:
                     [printmaster(f"output_dict key: {k}, shape: {v.shape}") for k, v in output_dict.items()]
@@ -582,6 +588,7 @@ def pretrain(
                         MVC=False,
                         input_cell_emb=previous_cell_embs,
                         generative_training=True,
+                        cell_type_ids=cell_type_ids
                     )
                     loss_gen = criterion(preds_dict['gen_preds'], gen_expr_target, positions_to_match)
                 if aux_loss1 is not None:
@@ -613,20 +620,22 @@ def pretrain(
 
             running_loss_mse += loss_mse.item()
             running_loss_mvc += loss_mvc.item()
+            running_loss_aux += aux_loss.item() if aux_loss is not None else 0.0
             running_loss_gen += loss_gen.item()
             running_loss_total += total_loss.item()
             if ((i+1) % args.log_interval == 0):
-                delta_training_time = log_training(args, scheduler, writer, training_start_time, delta_training_time, n_total_batches, global_iter, epoch, running_loss_mse, running_loss_mvc, running_loss_gen, running_loss_total, i, args.log_interval)
-                running_loss_mse, running_loss_mvc, running_loss_gen, running_loss_total = 0.0, 0.0, 0.0, 0.0
+                delta_training_time = log_training(args, scheduler, writer, training_start_time, delta_training_time, n_total_batches, global_iter, epoch, running_loss_mse, running_loss_mvc, running_loss_aux, running_loss_gen, running_loss_total, i, args.log_interval)
+                running_loss_mse, running_loss_mvc, running_loss_aux, running_loss_gen, running_loss_total = 0.0, 0.0, 0.0, 0.0, 0.0
 
             if ((i+1) % args.save_interval == 0) and validation_loader is not None:
                 best_val_mse, delta_training_time = eval_and_save(args, model, train_loader, validation_loader, criterion, optimizer, scheduler, device, vocab, scaler, best_val_mse, writer, training_start_time, delta_training_time, global_iter, epoch, i)
                 model.train()
             global_iter += 1
             dist.barrier()
+            break
 
-        delta_training_time = log_training(args, scheduler, writer, training_start_time, delta_training_time, n_total_batches, global_iter, epoch, running_loss_mse, running_loss_mvc, running_loss_gen, running_loss_total, i, ((i+1) % args.log_interval))
-        running_loss_mse, running_loss_mvc, running_loss_gen, running_loss_total = 0.0, 0.0, 0.0, 0.0
+        delta_training_time = log_training(args, scheduler, writer, training_start_time, delta_training_time, n_total_batches, global_iter, epoch, running_loss_mse, running_loss_mvc, running_loss_aux, running_loss_gen, running_loss_total, i, ((i+1) % args.log_interval))
+        running_loss_mse, running_loss_mvc, running_loss_aux, running_loss_gen, running_loss_total = 0.0, 0.0, 0.0, 0.0, 0.0
         if validation_loader is not None:
             best_val_mse, delta_training_time = eval_and_save(args, model, train_loader, validation_loader, criterion, optimizer, scheduler, device, vocab, scaler, best_val_mse, writer, training_start_time, delta_training_time, global_iter, epoch+1, 0)
         dist.barrier()
@@ -634,7 +643,7 @@ def pretrain(
     printmaster("Training complete.")
 
 
-def log_training(args, scheduler, writer, training_start_time, delta_training_time, n_total_batches, global_iter, epoch, running_loss_mse, running_loss_mvc, running_loss_gen, running_loss_total, i, denominator):
+def log_training(args, scheduler, writer, training_start_time, delta_training_time, n_total_batches, global_iter, epoch, running_loss_mse, running_loss_mvc, running_loss_aux, running_loss_gen, running_loss_total, i, denominator):
     total_time_elapsed = time.time() - training_start_time
     delta_time_elapsed = time.time() - delta_training_time
     delta_training_time = time.time()
@@ -655,6 +664,8 @@ def log_training(args, scheduler, writer, training_start_time, delta_training_ti
         )
         writer.add_scalar("loss/mse", running_loss_mse / denominator, global_iter)
         writer.add_scalar("loss/mvc", running_loss_mvc / denominator, global_iter)
+        if running_loss_aux > 0.0:
+            writer.add_scalar("loss/aux", running_loss_aux / denominator, global_iter)
         writer.add_scalar("loss/gen", running_loss_gen / denominator, global_iter)
         writer.add_scalar("loss/total", running_loss_total / denominator, global_iter)
         writer.add_scalar("lr", scheduler.get_last_lr()[0], global_iter)
@@ -879,9 +890,9 @@ def initialize_additional_arguments(args: argparse.Namespace) -> argparse.Namesp
         args.pad_value = -2
         args.n_input_bins = args.n_bins
 
-    if args.training_tasks in ["gen", "both"]:
-        args.mask_ratio = [0.25, 0.50, 0.75]
-        printmaster(f"args.mask_ratio: {args.mask_ratio} (can be float or list of floats)")
+    # if args.training_tasks in ["gen", "both"]:
+    #     args.mask_ratio = [0.25, 0.50, 0.75]
+    #     printmaster(f"args.mask_ratio: {args.mask_ratio} (can be float or list of floats)")
     args.data_paths = argparser.get_datapaths(args)
     if args.streaming:
         args.train_paths, args.valid_paths = get_split_paths(args)

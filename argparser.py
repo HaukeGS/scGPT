@@ -37,7 +37,7 @@ def add_arguments(parser: argparse.ArgumentParser):
     parser.add_argument(
         "--cache-dir",
         type=str,
-        default="/home/hauke.schuele/datasets_cache",
+        default="/projects/extern/kisski/kisski-scgpt-pretraining-moe/dir.project/datasets_cache",
         help="The directory to use for caching streaming datasets. If not provided, a 'cache' subdirectory will be created in the same directory as the data files.",
     )
      # settings for saving and loading models
@@ -155,6 +155,13 @@ def add_arguments(parser: argparse.ArgumentParser):
         type=str,
         required=True,
         help="Path to the vocabulary file.",
+    )
+    parser.add_argument(
+        "--cell-type-vocab-path",
+        type=str,
+        required=False,
+        default=None,
+        help="When including the cell_type for MoE routing explainability, provide a cell-type-vocab"
     )
     # settings for training
     parser.add_argument(
@@ -321,6 +328,12 @@ def add_arguments(parser: argparse.ArgumentParser):
         action="store_true",
         help="Whether to create separate log files for each GPU in distributed "
         "training. Default is False.",
+    )
+    parser.add_argument(
+        "--expert-specialization",
+        type=str2bool,
+        default=False,
+        help="Whether to enable logging of layer distribution in experts of MoE.",
     )
 
 

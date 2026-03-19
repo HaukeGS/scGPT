@@ -56,6 +56,7 @@ class TransformerModel(nn.Module):
         use_sim_decoder: bool = False,
         num_experts: Optional[int] = None,
         k: Optional[int] = None,
+        expert_specializationx: bool = False,
     ):
         super().__init__()
         self.model_type = "Transformer"
@@ -119,7 +120,7 @@ class TransformerModel(nn.Module):
                 num_experts=num_experts,
                 k=k,
             )
-            self.transformer_encoder = FlashscGPTGenerator(encoder_layers, nlayers)
+            self.transformer_encoder = FlashscGPTGenerator(encoder_layers, nlayers, expert_specialization=expert_specializationx)
         elif use_fast_transformer:
             if fast_transformer_backend == "linear":
                 self.transformer_encoder = FastTransformerEncoderWrapper(
@@ -219,6 +220,7 @@ class TransformerModel(nn.Module):
         gen_key_padding_mask: Tensor,
         batch_labels: Optional[Tensor] = None,  # (batch,)
         input_cell_emb: Optional[Tensor] = None,  # (batch, seq_len, embsize)
+        cell_type_ids: Optional[Tensor] = None,
     ) -> Tuple[Tensor, Tensor]:
         self._check_batch_labels(batch_labels)
 
@@ -265,6 +267,9 @@ class TransformerModel(nn.Module):
             gen_total_embs,
             pcpt_key_padding_mask=pcpt_key_padding_mask,
             gen_key_padding_mask=gen_key_padding_mask,
+            cell_type_ids=cell_type_ids,
+            pcpt_genes=pcpt_genes,
+            gen_genes=gen_genes,
         )
 
         return pcpt_output, gen_output, aux_loss
@@ -472,6 +477,7 @@ class TransformerModel(nn.Module):
         ECS: bool = False,
         do_sample: bool = False,
         input_cell_emb: Optional[Tensor] = None,
+        cell_type_ids: Optional[Tensor] = None,
     ) -> Mapping[str, Tensor]:
         """
         Args:
@@ -506,6 +512,7 @@ class TransformerModel(nn.Module):
             gen_key_padding_mask,
             batch_labels,
             input_cell_emb=input_cell_emb,
+            cell_type_ids=cell_type_ids
         )
         if gen_output is None:
             transformer_output = pcpt_output

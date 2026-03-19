@@ -1,30 +1,5 @@
 #!/bin/bash
 
-# See `man sbatch` or https://slurm.schedmd.com/sbatch.html for descriptions of sbatch options.
-#SBATCH --job-name=scGPT_original              # Gets overwritten by run_and_monitor_job.sh!
-#SBATCH --nodes=1                                     # Number of nodes to request
-#SBATCH --ntasks-per-node=1                           # total number of tasks per node
-#SBATCH --gpus-per-node=A100:1                             # Number of GPUs to request
-#SBATCH --cpus-per-task=4                             # Number of CPUs to request
-#SBATCH --partition=kisski
-#SBATCH --output=/user/hauke.schuele/u26703/scGPT/logs/expert_specialization/%x-%j.out  # File to which STDOUT will be written
-#SBATCH --error=/user/hauke.schuele/u26703/scGPT/logs/expert_specialization/%x-%j.err   # File to which STDERR will be written
-#SBATCH --time=01:00:00              # Time limit (hh:mm:ss) debug time
-echo ""
-#SBATCH --output=/user/hauke.schuele/u26703/scGPT/logs/%x-%j.out  # File to which STDOUT will be written
-#SBATCH --error=/user/hauke.schuele/u26703/scGPT/logs/%x-%j.err  # File to which STDOUT will be written
-#SBATCH --time=48:00:00              # Time limit (hh:mm:ss) production time
-#SBATCH --time=36:00:00              # Time limit (hh:mm:ss) production time for less data
-#SBATCH --mem-per-gpu=16GB
-
-#SBATCH --mail-user=schuele.hauke@gmail.com
-#SBATCH --mail-type=ALL       # Type of email notification- BEGIN,END,FAIL,ALL
-
-module load gcc
-module load python
-module load miniforge3
-source activate scgpt
-
 # SLURM parameters
 master_address=$(scontrol show hostnames $SLURM_JOB_NODELIST | head -n 1)
 # master_port=$(id -u)
@@ -32,13 +7,13 @@ export MASTER_ADDR=$master_address
 # export MASTER_PORT=$master_port
 # export MASTER_PORT=51550
 export MASTER_PORT=$(((SLURM_JOB_ID % 10000) + 50000))
-export WORLD_SIZE=$(($SLURM_NNODES * $SLURM_NTASKS_PER_NODE))
+export WORLD_SIZE=1
+export SLURM_CPUS_PER_TASK=4
 echo "MASTER_ADDR=$MASTER_ADDR"
 echo "MASTER_PORT=$MASTER_PORT"
 echo "SLURM_NNODES=$SLURM_NNODES"
 echo "SLURM_NTASKS=$SLURM_NTASKS"
 echo "WORLD_SIZE=$WORLD_SIZE"
-
 
 # Script parameters
 streaming="false"
@@ -71,18 +46,20 @@ echo "Sorted tissues: ${TISSUES[@]}"
 
 if [ "$2" = "moe" ]; then
     echo "MOE training enabled."
-    NUM_EXPERTS=8
-    K=2
-    BATCH_SIZE=40
-    DATA_TISSUE_PATH="/user/hauke.schuele/u26703/.project/dir.project/cellxgene-celltype-column-2023-05-15"
-    CELL_TYPE_VOCAB_PATH="/user/hauke.schuele/u26703/.project/dir.project/cellxgene-celltype-column-2023-05-15/celltype_vocab.json"
+    NUM_EXPERTS=4
+    K=1
+    BATCH_SIZE=20
 else
     NUM_EXPERTS=0
     K=0
     BATCH_SIZE=60
-    # BATCH_SIZE=40 
-    DATA_TISSUE_PATH="/user/hauke.schuele/u26703/.project/dir.project/cellxgene-2023-05-15"
-    CELL_TYPE_VOCAB_PATH=None
+fi
+
+if [ "$2" = "0.4" ] || [ "$2" = "0.5" ] || [ "$2" = "0.6" ] || [ "$2" = "0.7" ]; then
+    echo "Mask ratio training enabled with mask ratio $2."
+    MASK_RATIO=$2
+else
+    MASK_RATIO=0.4
 fi
 
 
@@ -100,20 +77,19 @@ fi
 # fi
 
 
-
+DATA_TISSUE_PATH="/user/hauke.schuele/u26703/.project/dir.project/cellxgene-celltype-column-2023-05-15"
 
 
 # Batch size: 20 for normal, 13 for moe with e=8, k=2
 
 
-srun python -u /user/hauke.schuele/u26703/scGPT/pretrain_distributed_args.py \
+python -u /user/hauke.schuele/u26703/scGPT/pretrain_distributed_args.py \
     --tissues "${TISSUES[@]}" \
     --data-tissue-path "$DATA_TISSUE_PATH" \
     --epochs 6 \
     --training-tasks "both" \
     --save-dir "/user/hauke.schuele/u26703/scGPT/save/pretrain-distributed-[$SLURM_JOB_ID]-$(date +%Y-%m-%d_%H-%M-%S)" \
     --vocab-path "/user/hauke.schuele/u26703/.project/dir.project/cellxgene-celltype-column-2023-05-15/2023-05-15-vocab.json" \
-    --cell-type-vocab-path $CELL_TYPE_VOCAB_PATH \
     --save-interval 50000 \
     --log-interval 1000 \
     --batch-size $BATCH_SIZE  \
@@ -125,7 +101,7 @@ srun python -u /user/hauke.schuele/u26703/scGPT/pretrain_distributed_args.py \
     --separate-gpu-log-files \
     --lr 0.0001 \
     --warmup-ratio-or-steps 10000 \
-    --mask-ratio 0.4 \
+    --mask-ratio $MASK_RATIO \
     --num-experts $NUM_EXPERTS \
     --k $K \
     --nlayers 12 \

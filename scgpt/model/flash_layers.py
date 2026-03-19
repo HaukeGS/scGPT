@@ -77,8 +77,8 @@ class FlashscGPTMHA(nn.Module):
         """
         pcpt_total_embs: (batch, pcpt_len, hidden_dim) (where hidden_dim = num heads * head dim)
         gen_total_embs: (batch, gen_len, hidden_dim)
-        pcpt_key_padding_mask: bool tensor of shape (batch, pcpt_len), 1 means valid and 0 means not valid.
-        gen_key_padding_mask: bool tensor of shape (batch, gen_len), 1 means valid and 0 means not valid.
+        pcpt_key_padding_mask: bool tensor of shape (batch, pcpt_len), 1 means flat_mask and 0 means not flat_mask.
+        gen_key_padding_mask: bool tensor of shape (batch, gen_len), 1 means flat_mask and 0 means not flat_mask.
         """
         pcpt_qkv = self.Wqkv(pcpt_total_embs)
 
@@ -287,6 +287,42 @@ class FlashscGPTLayer(nn.Module):
             # no padding tokens in src
             return None
         return ~src_key_padding_mask
+    
+
+    def _apply_moe_masked(
+        self,
+        embs: Tensor,                          # (batch_size, seq_len, embed_dim)
+        key_padding_mask: Optional[Tensor],   # (batch_size, seq_len), True = padded
+        gene_ids: Optional[Tensor] = None,          # (batch_size, seq_len)
+        cell_type_ids: Optional[Tensor] = None,    # (batch_size, 1)
+    ) -> tuple[Tensor, Tensor]:
+        batch_size, seq_len, embed_dim = embs.shape
+        flat_embeddings = embs.reshape(batch_size * seq_len, embed_dim) # (batch_size * seq_len, embed_dim)
+
+        if key_padding_mask is None:
+            out_flat, aux_loss = self.moe(flat_embeddings)
+            return out_flat.reshape(batch_size, seq_len, embed_dim), aux_loss
+
+        flat_mask = (~key_padding_mask).reshape(batch_size * seq_len)  # True = real token
+        out_flat = torch.zeros_like(flat_embeddings)
+        gene_ids_flat = gene_ids.reshape(batch_size * seq_len) if gene_ids is not None else None
+        cell_type_ids_flat = cell_type_ids.repeat_interleave(seq_len, dim=0) if cell_type_ids is not None else None
+
+        print(f"flat_embeddings.shape: {flat_embeddings.shape}")
+        print(f"flat_mask.shape: {flat_mask.shape}")
+        print(f"flat_embeddings[flat_mask].shape: {flat_embeddings[flat_mask].shape}")
+        print(f"gene_ids_flat.shape: {gene_ids_flat.shape}" if gene_ids is not None else "gene_ids_flat is None")
+        print(f"cell_type_ids.shape: {cell_type_ids.shape}" if cell_type_ids is not None else "cell_type_ids is None")
+        print(f"cell_type_ids_flat.shape: {cell_type_ids_flat.shape}" if cell_type_ids is not None else "cell_type_ids_flat is None")
+
+        if flat_mask.any():
+            out_valid, aux_loss = self.moe(flat_embeddings[flat_mask])
+            out_flat[flat_mask] = out_valid
+        else:
+            aux_loss = flat_embeddings.new_zeros(())
+
+        return out_flat.reshape(batch_size, seq_len, embed_dim), aux_loss
+
 
     def forward(
         self,
@@ -294,6 +330,9 @@ class FlashscGPTLayer(nn.Module):
         gen_total_embs: Tensor,
         pcpt_key_padding_mask: Optional[Tensor] = None,
         gen_key_padding_mask: Optional[Tensor] = None,
+        cell_type_ids: Optional[Tensor] = None,
+        pcpt_genes: Optional[Tensor] = None,
+        gen_genes: Optional[Tensor] = None,
     ) -> Tensor:
         r"""Pass the input through the encoder layer.
 
@@ -348,10 +387,11 @@ class FlashscGPTLayer(nn.Module):
 
             if hasattr(self, "moe") and self.moe is not None:
                 # Mixture of Experts
-                batch_size, seq_len, embed_dim = pcpt_total_embs.shape
-                pcpt_flat = pcpt_total_embs.reshape(batch_size * seq_len, embed_dim)
-                pcpt_total_embs2, aux_loss_pcpt = self.moe(pcpt_flat)
-                pcpt_total_embs2 = pcpt_total_embs2.reshape(batch_size, seq_len, embed_dim)
+                pcpt_total_embs2, aux_loss_pcpt = self._apply_moe_masked(pcpt_total_embs, pcpt_key_padding_mask, pcpt_genes, cell_type_ids)
+                # batch_size, seq_len, embed_dim = pcpt_total_embs.shape
+                # pcpt_flat = pcpt_total_embs.reshape(batch_size * seq_len, embed_dim)
+                # pcpt_total_embs2, aux_loss_pcpt = self.moe(pcpt_flat)
+                # pcpt_total_embs2 = pcpt_total_embs2.reshape(batch_size, seq_len, embed_dim)
             else:
                 pcpt_total_embs2 = self.linear2(
                     self.dropout(self.activation(self.linear1(pcpt_total_embs)))
@@ -367,10 +407,11 @@ class FlashscGPTLayer(nn.Module):
 
                 if hasattr(self, "moe") and self.moe is not None:
                     # Mixture of Experts
-                    batch_size, seq_len, embed_dim = gen_total_embs.shape
-                    gen_flat = gen_total_embs.reshape(batch_size * seq_len, embed_dim)
-                    gen_total_embs2, aux_loss_gen = self.moe(gen_flat)
-                    gen_total_embs2 = gen_total_embs2.reshape(batch_size, seq_len, embed_dim)
+                    gen_total_embs2, aux_loss_gen = self._apply_moe_masked(gen_total_embs, gen_key_padding_mask, gen_genes, cell_type_ids)
+                    # batch_size, seq_len, embed_dim = gen_total_embs.shape
+                    # gen_flat = gen_total_embs.reshape(batch_size * seq_len, embed_dim)
+                    # gen_total_embs2, aux_loss_gen = self.moe(gen_flat)
+                    # gen_total_embs2 = gen_total_embs2.reshape(batch_size, seq_len, embed_dim)
                 else:
                     gen_total_embs2 = self.linear2(
                         self.dropout(self.activation(self.linear1(gen_total_embs)))
@@ -416,12 +457,14 @@ class FlashscGPTGenerator(nn.Module):
         num_layers,
         norm=None,
         mask_check=True,
+        expert_specialization=False,
     ):
         super().__init__()
         self.layers = _get_clones(encoder_layer, num_layers)
         self.num_layers = num_layers
         self.norm = norm
         self.mask_check = mask_check
+        self.expert_specialization = expert_specialization
 
     def forward(
         self,
@@ -429,6 +472,9 @@ class FlashscGPTGenerator(nn.Module):
         gen_total_embs: Tensor,
         pcpt_key_padding_mask: Optional[Tensor] = None,
         gen_key_padding_mask: Optional[Tensor] = None,
+        cell_type_ids: Optional[Tensor] = None,
+        pcpt_genes: Optional[Tensor] = None,
+        gen_genes: Optional[Tensor] = None,
     ) -> Tensor:
         r"""Pass the input through the encoder layers in turn.
 
@@ -449,16 +495,37 @@ class FlashscGPTGenerator(nn.Module):
                     "only bool and floating types of key_padding_mask are supported"
                 )
 
-        for mod in self.layers:
+        running_aux_loss = None
+        for i, mod in enumerate(self.layers):
+            print(f"Layer {i}:")
             pcpt_total_embs, gen_total_embs, aux_loss = mod(
                 pcpt_total_embs,
                 gen_total_embs,
                 pcpt_key_padding_mask,
                 gen_key_padding_mask,
+                cell_type_ids,
+                pcpt_genes,
+                gen_genes,
             )
+            if self.expert_specialization:
+                gene_label_distribution_tensor = torch.zeros(
+                    len(self.layers), 
+                    n_experts, 
+                    n_genes,
+                    device='cpu', 
+                    dtype=torch.int32
+                )
+                cell_type_label_distribution_tensor = torch.zeros(
+                    len(self.layers), 
+                    n_experts,
+                    n_cell_types,
+                    device='cpu', 
+                    dtype=torch.int32
+                )
+            running_aux_loss = aux_loss if running_aux_loss is None else running_aux_loss + aux_loss
 
         if self.norm is not None:
             pcpt_total_embs = self.norm(pcpt_total_embs)
             gen_total_embs = self.norm(gen_total_embs)
 
-        return pcpt_total_embs, gen_total_embs, aux_loss
+        return pcpt_total_embs, gen_total_embs, running_aux_loss

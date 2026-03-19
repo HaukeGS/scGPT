@@ -255,9 +255,11 @@ class MoE(nn.Module):
             load = self._gates_to_load(gates)
         return gates, load
 
-    def forward(self, x, loss_coef=1e-2):
+    def forward(self, x, gene_ids=None, cell_type_ids=None, loss_coef=1e-2):
         """Args:
-        x: tensor shape [batch_size, input_size]
+        x: tensor shape [batch_size * seq_len, input_size]
+        gene_ids: tensor shape [batch_size * seq_len, 1] with gene IDs
+        cell_type_ids: tensor shape [batch_size * seq_len, 1] with cell type IDs
         train: a boolean scalar.
         loss_coef: a scalar - multiplier on load-balancing losses
 
@@ -270,7 +272,11 @@ class MoE(nn.Module):
         gates, load = self.noisy_top_k_gating(x, self.training)
         # calculate importance loss
         importance = gates.sum(0)
-        #
+
+        activated_experts = gates.topk(self.k, dim=1)[1]
+        print(f"activated_experts.shape: {activated_experts.shape}") # expected to be (batch_size * seq_len, k)
+        print(f"activated_experts: {activated_experts}")
+
         loss = self.cv_squared(importance) + self.cv_squared(load)
         loss *= loss_coef
 

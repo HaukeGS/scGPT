@@ -6,6 +6,9 @@ __pycache__/
 # C extensions
 *.so
 
+#SLURM
+pretrain_distributed.sh
+
 # Distribution / packaging
 .Python
 build/

@@ -3,6 +3,7 @@ from typing import Any, Dict, List, Mapping, Optional, Tuple, Union
 
 import torch
 import numpy as np
+import json
 
 from .preprocess import binning
 
@@ -54,6 +55,7 @@ class DataCollator:
     reserve_keys: List[str] = field(default_factory=lambda: [])
     keep_first_n_tokens: int = 1
     data_style: str = "pcpt"
+    cell_type_vocab_path: Optional[str] = None
 
     def __post_init__(self):
         if self.do_padding:
@@ -302,9 +304,20 @@ class DataCollator:
         padded_pcpt_expressions = []
         padded_gen_genes = []
         padded_gen_expressions = []
+        if self.cell_type_vocab_path is not None:
+            cell_type_ids = []
         for i in range(len(examples)):
+            # if i == 0:
+            #     print(f"keys: {examples[i].keys()}")
+            #     print(f"number of genes: {examples[i]['genes'].shape}")
             genes = examples[i]["genes"]
             expressions = examples[i]["expressions"]
+            if self.cell_type_vocab_path is not None:
+                cell_type = examples[i]["cell_type"]
+                with open("/user/hauke.schuele/u26703/.project/dir.project/cellxgene-celltype-column-2023-05-15/celltype_vocab.json", "r") as celltype_vocab:
+                    celltype_dict = json.load(celltype_vocab)
+                    cell_type_id = celltype_dict[cell_type]
+                cell_type_ids.append(torch.tensor([cell_type_id], device=device))
             if self.do_binning:
                 expressions[self.keep_first_n_tokens :] = binning(
                     row=expressions[self.keep_first_n_tokens :],
@@ -344,13 +357,22 @@ class DataCollator:
         padded_pcpt_expressions = torch.stack(padded_pcpt_expressions, dim=0)
         padded_gen_genes = torch.stack(padded_gen_genes, dim=0)
         padded_gen_expressions = torch.stack(padded_gen_expressions, dim=0)
-
-        data_dict = {
-            "pcpt_gene": padded_pcpt_genes,
-            "pcpt_expr": padded_pcpt_expressions,
-            "gen_gene": padded_gen_genes,
-            "gen_expr_target": padded_gen_expressions,
-        }
+        if self.cell_type_vocab_path is not None:
+            cell_type_ids = torch.stack(cell_type_ids, dim=0)
+            data_dict = {
+                "pcpt_gene": padded_pcpt_genes,
+                "pcpt_expr": padded_pcpt_expressions,
+                "gen_gene": padded_gen_genes,
+                "gen_expr_target": padded_gen_expressions,
+                "cell_type_id": cell_type_ids,
+            }
+        else:
+            data_dict = {
+                "pcpt_gene": padded_pcpt_genes,
+                "pcpt_expr": padded_pcpt_expressions,
+                "gen_gene": padded_gen_genes,
+                "gen_expr_target": padded_gen_expressions,
+            }
 
         return data_dict
 
