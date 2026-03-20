@@ -255,7 +255,7 @@ class MoE(nn.Module):
             load = self._gates_to_load(gates)
         return gates, load
 
-    def forward(self, x, gene_ids=None, cell_type_ids=None, loss_coef=1e-2):
+    def forward(self, x, expert_specialization=False, loss_coef=1e-2):
         """Args:
         x: tensor shape [batch_size * seq_len, input_size]
         gene_ids: tensor shape [batch_size * seq_len, 1] with gene IDs
@@ -273,9 +273,17 @@ class MoE(nn.Module):
         # calculate importance loss
         importance = gates.sum(0)
 
-        activated_experts = gates.topk(self.k, dim=1)[1]
-        print(f"activated_experts.shape: {activated_experts.shape}") # expected to be (batch_size * seq_len, k)
-        print(f"activated_experts: {activated_experts}")
+        if expert_specialization:
+            with torch.no_grad():
+                rows_indices_per_expert = [torch.where(gates[:, e] > 0)[0] for e in range(gates.size(1))]
+                print(f"rows_indices_per_expert.shape: {rows_indices_per_expert.shape}") # expected to be (batch_size * seq_len, k)
+                print(f"type(rows_indices_per_expert): {type(rows_indices_per_expert)}")
+                print(f"rows_indices_per_expert: {rows_indices_per_expert}")
+            # activated_experts = gates.topk(self.k, dim=1)[1]
+            # print(f"activated_experts.shape: {activated_experts.shape}") # expected to be (batch_size * seq_len, k)
+            # print(f"activated_experts: {activated_experts}")
+        else:
+            rows_indices_per_expert = None
 
         loss = self.cv_squared(importance) + self.cv_squared(load)
         loss *= loss_coef
@@ -285,4 +293,4 @@ class MoE(nn.Module):
         gates = dispatcher.expert_to_gates()
         expert_outputs = [self.experts[i](expert_inputs[i]) for i in range(self.num_experts)]
         y = dispatcher.combine(expert_outputs)
-        return y, loss
+        return y, loss, rows_indices_per_expert

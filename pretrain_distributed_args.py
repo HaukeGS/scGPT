@@ -353,6 +353,7 @@ def create_collator(
         max_length=args.max_seq_len,
         sampling=args.trunc_by_sample,
         data_style=args.training_tasks,
+        cell_type_vocab_path=args.cell_type_vocab_path,
     )
     return collator
 
@@ -541,6 +542,8 @@ def pretrain(
                 cell_type_ids = data_dict.get("cell_type_id", None)
                 cell_type_ids = cell_type_ids.to(device) if cell_type_ids is not None else None
                 print(f"cell_type_ids.shape: {cell_type_ids.shape}" if cell_type_ids is not None else "cell_type_ids is None")
+            else:
+                cell_type_ids = None
             pcpt_key_padding_mask = pcpt_gene.eq(vocab[args.pad_token])
             gen_key_padding_mask = gen_gene.eq(vocab[args.pad_token])
 
@@ -628,7 +631,7 @@ def pretrain(
                 running_loss_mse, running_loss_mvc, running_loss_aux, running_loss_gen, running_loss_total = 0.0, 0.0, 0.0, 0.0, 0.0
 
             if ((i+1) % args.save_interval == 0) and validation_loader is not None:
-                best_val_mse, delta_training_time = eval_and_save(args, model, train_loader, validation_loader, criterion, optimizer, scheduler, device, vocab, scaler, best_val_mse, writer, training_start_time, delta_training_time, global_iter, epoch, i)
+                best_val_mse, delta_training_time = eval_and_save(args, model, train_loader, validation_loader, cell_type_ids, criterion, optimizer, scheduler, device, vocab, scaler, best_val_mse, writer, training_start_time, delta_training_time, global_iter, epoch, i)
                 model.train()
             global_iter += 1
             dist.barrier()
@@ -637,7 +640,7 @@ def pretrain(
         delta_training_time = log_training(args, scheduler, writer, training_start_time, delta_training_time, n_total_batches, global_iter, epoch, running_loss_mse, running_loss_mvc, running_loss_aux, running_loss_gen, running_loss_total, i, ((i+1) % args.log_interval))
         running_loss_mse, running_loss_mvc, running_loss_aux, running_loss_gen, running_loss_total = 0.0, 0.0, 0.0, 0.0, 0.0
         if validation_loader is not None:
-            best_val_mse, delta_training_time = eval_and_save(args, model, train_loader, validation_loader, criterion, optimizer, scheduler, device, vocab, scaler, best_val_mse, writer, training_start_time, delta_training_time, global_iter, epoch+1, 0)
+            best_val_mse, delta_training_time = eval_and_save(args, model, train_loader, validation_loader, cell_type_ids, criterion, optimizer, scheduler, device, vocab, scaler, best_val_mse, writer, training_start_time, delta_training_time, global_iter, epoch+1, 0)
         dist.barrier()
     writer.close()
     printmaster("Training complete.")
@@ -673,7 +676,7 @@ def log_training(args, scheduler, writer, training_start_time, delta_training_ti
     return 0
 
 
-def eval_and_save(args, model, train_loader, validation_loader, criterion, optimizer, scheduler, device, vocab, scaler, best_val_mse, writer, training_start_time, delta_training_time, global_iter, epoch, i):
+def eval_and_save(args, model, train_loader, validation_loader, cell_type_ids, criterion, optimizer, scheduler, device, vocab, scaler, best_val_mse, writer, training_start_time, delta_training_time, global_iter, epoch, i):
     val_mse, val_mre = evaluate(
         model=model,
         validation_loader=validation_loader,
@@ -683,6 +686,7 @@ def eval_and_save(args, model, train_loader, validation_loader, criterion, optim
         fp16_enabled=args.fp16,
         mask_value=args.mask_value,
         criterion=criterion,
+        cell_type_ids=cell_type_ids
     )
     if is_master_gpu():
         writer.add_scalar("validation/mse", val_mse, global_iter)
@@ -742,6 +746,7 @@ def evaluate(
         fp16_enabled: bool,
         mask_value: float,
         criterion: nn.Module,
+        cell_type_ids: Optional[torch.Tensor] = None
     ) -> Dict[str, torch.Tensor]:
     """
     Evaluate the model on the evaluation data.
@@ -775,6 +780,7 @@ def evaluate(
                     CLS=False,
                     MVC=False,
                     generative_training=True,
+                    cell_type_ids=cell_type_ids
                 )
                 output_values = output_dict["gen_preds"]
 

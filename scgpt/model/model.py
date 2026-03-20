@@ -56,7 +56,7 @@ class TransformerModel(nn.Module):
         use_sim_decoder: bool = False,
         num_experts: Optional[int] = None,
         k: Optional[int] = None,
-        expert_specializationx: bool = False,
+        expert_specialization_params: Optional[Dict] = None,
     ):
         super().__init__()
         self.model_type = "Transformer"
@@ -120,7 +120,7 @@ class TransformerModel(nn.Module):
                 num_experts=num_experts,
                 k=k,
             )
-            self.transformer_encoder = FlashscGPTGenerator(encoder_layers, nlayers, expert_specialization=expert_specializationx)
+            self.transformer_encoder = FlashscGPTGenerator(encoder_layers, nlayers, expert_specialization_params=expert_specialization_params)
         elif use_fast_transformer:
             if fast_transformer_backend == "linear":
                 self.transformer_encoder = FastTransformerEncoderWrapper(
