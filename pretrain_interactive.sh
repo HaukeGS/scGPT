@@ -15,6 +15,7 @@ echo "SLURM_NNODES=$SLURM_NNODES"
 echo "SLURM_NTASKS=$SLURM_NTASKS"
 echo "WORLD_SIZE=$WORLD_SIZE"
 
+
 # Script parameters
 streaming="false"
 interleaved="false"
@@ -46,35 +47,21 @@ echo "Sorted tissues: ${TISSUES[@]}"
 
 if [ "$2" = "moe" ]; then
     echo "MOE training enabled."
-    NUM_EXPERTS=4
-    K=1
-    BATCH_SIZE=20
+    NUM_EXPERTS=8
+    K=2
+    BATCH_SIZE=10
+    DATA_TISSUE_PATH="/user/hauke.schuele/u26703/.project/dir.project/cellxgene-celltype-column-2023-05-15"
+    CELL_TYPE_VOCAB_PATH="/user/hauke.schuele/u26703/.project/dir.project/cellxgene-celltype-column-2023-05-15/celltype_vocab.json"
+    EXPERT_SPECIALIZATION="true"
 else
     NUM_EXPERTS=0
     K=0
     BATCH_SIZE=60
+    # BATCH_SIZE=40 
+    DATA_TISSUE_PATH="/user/hauke.schuele/u26703/.project/dir.project/cellxgene-2023-05-15"
+    CELL_TYPE_VOCAB_PATH=None
+    EXPERT_SPECIALIZATION="false"
 fi
-
-if [ "$2" = "0.4" ] || [ "$2" = "0.5" ] || [ "$2" = "0.6" ] || [ "$2" = "0.7" ]; then
-    echo "Mask ratio training enabled with mask ratio $2."
-    MASK_RATIO=$2
-else
-    MASK_RATIO=0.4
-fi
-
-
-# Data paths
-# if [ "$interleaved" = "true" ]; then
-#     DATA_TISSUE_PATH="/home/hauke.schuele/cellxgene_data_interleaved/"
-# else
-#     if [ "$streaming" = "true" ]; then
-#         DATA_TISSUE_PATH="/home/hauke.schuele/cellxgene_data_sharded_validation/"
-#         # echo "Using streaming with non-interleaved data is no more supported. Exiting."
-#         # exit 1
-#     else
-#         DATA_TISSUE_PATH="/home/hauke.schuele/cellxgene_data_2023-05-15/"
-#     fi
-# fi
 
 
 DATA_TISSUE_PATH="/user/hauke.schuele/u26703/.project/dir.project/cellxgene-celltype-column-2023-05-15"
@@ -90,10 +77,12 @@ python -u /user/hauke.schuele/u26703/scGPT/pretrain_distributed_args.py \
     --training-tasks "both" \
     --save-dir "/user/hauke.schuele/u26703/scGPT/save/pretrain-distributed-[$SLURM_JOB_ID]-$(date +%Y-%m-%d_%H-%M-%S)" \
     --vocab-path "/user/hauke.schuele/u26703/.project/dir.project/cellxgene-celltype-column-2023-05-15/2023-05-15-vocab.json" \
+    --cell-type-vocab-path $CELL_TYPE_VOCAB_PATH \
     --save-interval 50000 \
     --log-interval 1000 \
     --batch-size $BATCH_SIZE  \
     --valid-ratio 0.003 \
+    --mask-ratio 0.4 \
     --trunc-by-sample \
     --no-cls \
     --no-cce \
@@ -101,12 +90,12 @@ python -u /user/hauke.schuele/u26703/scGPT/pretrain_distributed_args.py \
     --separate-gpu-log-files \
     --lr 0.0001 \
     --warmup-ratio-or-steps 10000 \
-    --mask-ratio $MASK_RATIO \
     --num-experts $NUM_EXPERTS \
     --k $K \
-    --nlayers 12 \
+    --nlayers 4 \
     --nheads 8 \
-    --embsize 512 \
-    --d-hid 512 \
+    --embsize 64 \
+    --d-hid 64 \
+    --expert-specialization $EXPERT_SPECIALIZATION \
     # --shuffle-buffer-size 0 \
     # --checkpoint-dir "/home/hauke.schuele/save/pretrain-distributed-[257990]-2025-11-18_00-27-20" \

@@ -295,55 +295,76 @@ class FlashscGPTLayer(nn.Module):
         key_padding_mask: Optional[Tensor],   # (batch_size, seq_len), True = padded
         gene_ids: Optional[Tensor] = None,          # (batch_size, seq_len)
         cell_type_ids: Optional[Tensor] = None,    # (batch_size, 1)
-        expert_specialization: bool = False
+        expert_specialization_params: Optional[Dict] = None
     ) -> tuple[Tensor, Tensor]:
         batch_size, seq_len, embed_dim = embs.shape
+        # print(f"batch size: {batch_size}, seq_len: {seq_len}, embed_dim: {embed_dim}")
         flat_embeddings = embs.reshape(batch_size * seq_len, embed_dim) # (batch_size * seq_len, embed_dim)
 
         if key_padding_mask is None:
-            out_flat, aux_loss, rows_indices_per_expert = self.moe(flat_embeddings, expert_specialization)
-            return out_flat.reshape(batch_size, seq_len, embed_dim), aux_loss, rows_indices_per_expert if expert_specialization else None
+            raise ValueError("key_padding_mask cannot be None for _apply_moe_masked, since we need to know which rows are valid for MoE")
+            # out_flat, aux_loss, rows_indices_per_expert = self.moe(flat_embeddings, True if expert_specialization_params is not None else False)
+            # return out_flat.reshape(batch_size, seq_len, embed_dim), aux_loss, rows_indices_per_expert if expert_specialization_params else None # TODO
 
         flat_mask = (~key_padding_mask).reshape(batch_size * seq_len)  # True = real token
         out_flat = torch.zeros_like(flat_embeddings)
-        gene_ids_flat = gene_ids.reshape(batch_size * seq_len) if gene_ids is not None else None
-        cell_type_ids_flat = cell_type_ids.repeat_interleave(seq_len, dim=0) if cell_type_ids is not None else None
+        gene_ids_flat = gene_ids.reshape(batch_size * seq_len).squeeze() if gene_ids is not None else None
+        cell_type_ids_flat = cell_type_ids.repeat_interleave(seq_len, dim=0).squeeze() if cell_type_ids is not None else None
+        flat_embeddings_masked = flat_embeddings[flat_mask]
+        gene_ids_flat_masked = gene_ids_flat[flat_mask]
+        cell_type_ids_flat_masked = cell_type_ids_flat[flat_mask]
 
-        print(f"Expert Specialization: {expert_specialization}")
-        print(f"flat_embeddings.shape: {flat_embeddings.shape}")
-        print(f"flat_mask.shape: {flat_mask.shape}")
-        print(f"flat_embeddings[flat_mask].shape: {flat_embeddings[flat_mask].shape}")
-        print(f"gene_ids_flat.shape: {gene_ids_flat.shape}" if gene_ids is not None else "gene_ids_flat is None")
-        print(f"gene_ids_flat[flat_mask].shape: {gene_ids_flat[flat_mask].shape}" if gene_ids is not None else "gene_ids_flat is None")
-        print(f"cell_type_ids.shape: {cell_type_ids.shape}" if cell_type_ids is not None else "cell_type_ids is None")
-        print(f"cell_type_ids_flat.shape: {cell_type_ids_flat.shape}" if cell_type_ids is not None else "cell_type_ids_flat is None")
-        print(f"cell_type_ids_flat[flat_mask].shape: {cell_type_ids_flat[flat_mask].shape}" if cell_type_ids is not None else "cell_type_ids_flat is None")
-        print(f"gene_ids.size(0) for bincount: {gene_ids.size(0) if gene_ids is not None else None}")
-        print(f"cell_type_ids.size(0) for bincount: {cell_type_ids.size(0) if cell_type_ids is not None else None}")
-        print(f"len(gene_ids) for bincount: {len(gene_ids)}")
-        print(f"len(cell_type_ids) for bincount: {len(cell_type_ids)}")
+        # print(f"Expert Specialization_params: {expert_specialization_params}")
+        # print(f"flat_embeddings.shape: {flat_embeddings.shape}")
+        # print(f"flat_mask.shape: {flat_mask.shape}")
+        # print(f"flat_embeddings[flat_mask].shape: {flat_embeddings[flat_mask].shape}")
+        # print(f"gene_ids_flat.shape: {gene_ids_flat.shape}" if gene_ids is not None else "gene_ids_flat is None")
+        # print(f"gene_ids_flat[flat_mask].shape: {gene_ids_flat[flat_mask].shape}" if gene_ids is not None else "gene_ids_flat is None")
+        # print(f"cell_type_ids.shape: {cell_type_ids.shape}" if cell_type_ids is not None else "cell_type_ids is None")
+        # print(f"cell_type_ids_flat.shape: {cell_type_ids_flat.shape}" if cell_type_ids is not None else "cell_type_ids_flat is None")
+        # print(f"cell_type_ids_flat[flat_mask].shape: {cell_type_ids_flat[flat_mask].shape}" if cell_type_ids is not None else "cell_type_ids_flat is None")
 
         if flat_mask.any():
-            out_valid, aux_loss, rows_indices_per_expert = self.moe(flat_embeddings[flat_mask], expert_specialization)
+            out_valid, aux_loss, rows_indices_per_expert = self.moe(flat_embeddings_masked, True if expert_specialization_params is not None else False)
             out_flat[flat_mask] = out_valid
-            # minlength = len(gene_ids/cell_type_ids) is wrong here
-            # need the actual number of entries in the vocabularies
-            gene_label_distribution = [torch.bincount(gene_ids_flat[rows], minlength=len(gene_ids)) for rows in rows_indices_per_expert] if rows_indices_per_expert is not None and gene_ids is not None else None
-            cell_type_label_distribution = [torch.bincount(cell_type_ids_flat[rows], minlength=len(cell_type_ids)) for rows in rows_indices_per_expert] if rows_indices_per_expert is not None and cell_type_ids is not None else None
-            if gene_label_distribution is not None:
-                print(f"gene_label_distribution.shape: {[dist.shape for dist in gene_label_distribution]}")
-                print(f"gene_label_distribution sample: {[dist[:10] for dist in gene_label_distribution]}")
-                try:
-                    print(f"gene_label_distribution as tensor: {torch.stack(gene_label_distribution).shape} (should be [n_experts, n_genes])")
-                except Exception as e:
-                    print(f"Error converting gene_label_distribution to tensor: {e}")
+            if expert_specialization_params is not None:
+                n_experts = expert_specialization_params.get("n_experts", None)
+                n_genes = expert_specialization_params.get("n_genes", None)
+                n_cell_types = expert_specialization_params.get("n_cell_types", None)
+                assert(n_genes is not None and n_cell_types is not None)
+                assert(len(rows_indices_per_expert) == n_experts)
+                assert(all(isinstance(rows, torch.Tensor) for rows in rows_indices_per_expert))
+                # print(f"sum(expert.shape[0] for expert in rows_indices_per_expert): {sum(expert.shape[0] for expert in rows_indices_per_expert)}")
+                # print(f"gene_ids_flat[flat_mask].shape[0]: {gene_ids_flat[flat_mask].shape[0]}" if gene_ids is not None else "gene_ids_flat is None")
+                # print(f"max row index in rows_indices_per_expert: {max(rows.max().item() for rows in [rows for rows in rows_indices_per_expert if rows.numel() > 0])}")
+                assert(sum(expert.shape[0] for expert in rows_indices_per_expert) % gene_ids_flat_masked.shape[0] == 0)
+                assert(max(rows.max().item() for rows in [rows for rows in rows_indices_per_expert if rows.numel() > 0]) == gene_ids_flat_masked.shape[0]-1)
+                assert(sum(expert.shape[0] for expert in rows_indices_per_expert) % cell_type_ids_flat_masked.shape[0] == 0)
+                assert(max(rows.max().item() for rows in [rows for rows in rows_indices_per_expert if rows.numel() > 0]) == cell_type_ids_flat_masked.shape[0]-1)
+                # row_indices_per_expert is a list of length n_experts [e0, e1, ..., eN]
+                # where each element is a tensor of shape (num_tokens_for_this_expert,) containing the row indices in the original flat_embeddings[flat_mask] that are assigned to this expert.
+                # To get the gene label distribution for each expert, we can do a bincount on the gene_ids_flat[flat_mask] for the row indices corresponding to each expert. Similarly for cell type label distribution.
+                # print(f"rows_indices_per_expert[0].shape: {rows_indices_per_expert[0].shape}")
+                # print(f"unique rows_indices_per_expert[0].shape): {torch.unique(rows_indices_per_expert[0]).shape}")
+                # print(f"len(row_indices_per_expert): {len(rows_indices_per_expert)}")
+                # print(f"n_genes for bincount: {n_genes}")
+                # print(f"n_cell_types for bincount: {n_cell_types}")
+                # print(f"row_indices_per_expert[0]: {rows_indices_per_expert[0]}")
+                # print(f"type(rows_indices_per_expert[0]): {type(rows_indices_per_expert[0])}")
+                gene_label_distribution = torch.stack([torch.bincount(gene_ids_flat_masked[rows], minlength=n_genes) for rows in rows_indices_per_expert]) if rows_indices_per_expert is not None and gene_ids is not None else None
+                cell_type_label_distribution = torch.stack([torch.bincount(cell_type_ids_flat_masked[rows], minlength=n_cell_types) for rows in rows_indices_per_expert]) if rows_indices_per_expert is not None and cell_type_ids is not None else None
+                if gene_label_distribution is not None:
+                    print(f"gene_label_distribution.shape: {gene_label_distribution.shape}")
+                else:
+                    print(f"gene_label_distribution is None")
+                if cell_type_label_distribution is not None:
+                    print(f"cell_type_label_distribution.shape: {cell_type_label_distribution.shape}")
+                else:
+                    print(f"cell_type_label_distribution is None")
             else:
-                print(f"gene_label_distribution is None")
-            if cell_type_label_distribution is not None:
-                print(f"cell_type_label_distribution.shape: {[dist.shape for dist in cell_type_label_distribution]}")
-                print(f"cell_type_label_distribution sample: {[dist[:10] for dist in cell_type_label_distribution]}")
-            else:
-                print(f"cell_type_label_distribution is None")
+                aux_loss = None
+                gene_label_distribution = None
+                cell_type_label_distribution = None
         else:
             aux_loss = None
             gene_label_distribution = None
@@ -361,7 +382,7 @@ class FlashscGPTLayer(nn.Module):
         cell_type_ids: Optional[Tensor] = None,
         pcpt_genes: Optional[Tensor] = None,
         gen_genes: Optional[Tensor] = None,
-        expert_specialization: bool = False
+        expert_specialization_params: Optional[Dict] = None
     ) -> Tensor:
         r"""Pass the input through the encoder layer.
 
@@ -416,7 +437,7 @@ class FlashscGPTLayer(nn.Module):
 
             if hasattr(self, "moe") and self.moe is not None:
                 # Mixture of Experts
-                pcpt_total_embs2, aux_loss_pcpt, gene_label_distribution_pcpt, cell_type_label_distribution_pcpt = self._apply_moe_masked(pcpt_total_embs, pcpt_key_padding_mask, pcpt_genes, cell_type_ids, expert_specialization)
+                pcpt_total_embs2, aux_loss_pcpt, gene_label_distribution_pcpt, cell_type_label_distribution_pcpt = self._apply_moe_masked(pcpt_total_embs, pcpt_key_padding_mask, pcpt_genes, cell_type_ids, expert_specialization_params)
                 # batch_size, seq_len, embed_dim = pcpt_total_embs.shape
                 # pcpt_flat = pcpt_total_embs.reshape(batch_size * seq_len, embed_dim)
                 # pcpt_total_embs2, aux_loss_pcpt = self.moe(pcpt_flat)
@@ -436,7 +457,7 @@ class FlashscGPTLayer(nn.Module):
 
                 if hasattr(self, "moe") and self.moe is not None:
                     # Mixture of Experts
-                    gen_total_embs2, aux_loss_gen, gene_label_distribution_gen, cell_type_label_distribution_gen = self._apply_moe_masked(gen_total_embs, gen_key_padding_mask, gen_genes, cell_type_ids, expert_specialization)
+                    gen_total_embs2, aux_loss_gen, gene_label_distribution_gen, cell_type_label_distribution_gen = self._apply_moe_masked(gen_total_embs, gen_key_padding_mask, gen_genes, cell_type_ids, expert_specialization_params)
                     # batch_size, seq_len, embed_dim = gen_total_embs.shape
                     # gen_flat = gen_total_embs.reshape(batch_size * seq_len, embed_dim)
                     # gen_total_embs2, aux_loss_gen = self.moe(gen_flat)
@@ -512,6 +533,27 @@ class FlashscGPTGenerator(nn.Module):
         self.norm = norm
         self.mask_check = mask_check
         self.expert_specialization_params = expert_specialization_params
+        if self.expert_specialization_params is not None:
+            n_experts = self.expert_specialization_params.get("n_experts", None)
+            n_genes = self.expert_specialization_params.get("n_genes", None)
+            n_cell_types = self.expert_specialization_params.get("n_cell_types", None)
+            assert(n_experts is not None)
+            assert(n_genes is not None)
+            assert(n_cell_types is not None)
+            self.gene_label_layer_distributions = torch.zeros(
+                len(self.layers), 
+                n_experts, 
+                n_genes,
+                dtype=torch.int64
+            )
+            self.cell_type_label_layer_distributions = torch.zeros(
+                len(self.layers), 
+                n_experts,
+                n_cell_types,
+                dtype=torch.int64
+            )
+        else:
+            self.expert_specialization_params = None
 
     def forward(
         self,
@@ -546,6 +588,7 @@ class FlashscGPTGenerator(nn.Module):
         for i, mod in enumerate(self.layers):
             print(f"Layer {i}:")
             print(f"cell_type_ids present: {cell_type_ids is not None}")
+            print(f"self.expert_specialization_params: {self.expert_specialization_params}")
             pcpt_total_embs, gen_total_embs, aux_loss, gene_label_distribution, cell_type_label_distribution = mod(
                 pcpt_total_embs,
                 gen_total_embs,
@@ -554,38 +597,21 @@ class FlashscGPTGenerator(nn.Module):
                 cell_type_ids,
                 pcpt_genes,
                 gen_genes,
-                expert_specialization=True if self.expert_specialization_params is not None else False
+                self.expert_specialization_params
             )
             running_aux_loss = aux_loss if running_aux_loss is None else running_aux_loss + aux_loss
             print(f"gene_label_distribution.shape: {gene_label_distribution.shape if gene_label_distribution is not None else None}")
             print(f"cell_type_label_distribution.shape: {cell_type_label_distribution.shape if cell_type_label_distribution is not None else None}")
             if self.expert_specialization_params is not None:
-                n_experts = self.expert_specialization_params.get("n_experts", None)
-                n_genes = self.expert_specialization_params.get("n_genes", None)
-                n_cell_types = self.expert_specialization_params.get("n_cell_types", None)
-                assert(n_experts is not None)
-                assert(n_genes is not None)
-                assert(n_cell_types is not None)
-                gene_label_distribution_tensor = torch.zeros(
-                    len(self.layers), 
-                    n_experts, 
-                    n_genes,
-                    device='cpu', 
-                    dtype=torch.int32
-                )
-                cell_type_label_distribution_tensor = torch.zeros(
-                    len(self.layers), 
-                    n_experts,
-                    n_cell_types,
-                    device='cpu', 
-                    dtype=torch.int32
-                )
-            else :
-                gene_label_distribution_tensor = None
-                cell_type_label_distribution_tensor = None
+                if gene_label_distribution is not None:
+                    assert(gene_label_distribution.shape == self.gene_label_layer_distributions[i].shape)
+                    self.gene_label_layer_distributions[i] = gene_label_distribution
+                if cell_type_label_distribution is not None:
+                    assert(cell_type_label_distribution.shape == self.cell_type_label_layer_distributions[i].shape)
+                    self.cell_type_label_layer_distributions[i] = cell_type_label_distribution
 
         if self.norm is not None:
             pcpt_total_embs = self.norm(pcpt_total_embs)
             gen_total_embs = self.norm(gen_total_embs)
 
-        return pcpt_total_embs, gen_total_embs, running_aux_loss
+        return pcpt_total_embs, gen_total_embs, running_aux_loss, self.gene_label_layer_distributions if self.expert_specialization_params is not None else None, self.cell_type_label_layer_distributions if self.expert_specialization_params is not None else None

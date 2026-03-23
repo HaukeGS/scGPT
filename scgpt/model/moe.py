@@ -276,12 +276,6 @@ class MoE(nn.Module):
         if expert_specialization:
             with torch.no_grad():
                 rows_indices_per_expert = [torch.where(gates[:, e] > 0)[0] for e in range(gates.size(1))]
-                print(f"rows_indices_per_expert.shape: {rows_indices_per_expert.shape}") # expected to be (batch_size * seq_len, k)
-                print(f"type(rows_indices_per_expert): {type(rows_indices_per_expert)}")
-                print(f"rows_indices_per_expert: {rows_indices_per_expert}")
-            # activated_experts = gates.topk(self.k, dim=1)[1]
-            # print(f"activated_experts.shape: {activated_experts.shape}") # expected to be (batch_size * seq_len, k)
-            # print(f"activated_experts: {activated_experts}")
         else:
             rows_indices_per_expert = None
 

@@ -262,7 +262,7 @@ class TransformerModel(nn.Module):
         if input_cell_emb is not None:
             pcpt_total_embs[:, 0, :] = input_cell_emb
 
-        pcpt_output, gen_output, aux_loss = self.transformer_encoder(
+        pcpt_output, gen_output, aux_loss, gene_label_layer_distributions, cell_type_label_distribution = self.transformer_encoder(
             pcpt_total_embs,
             gen_total_embs,
             pcpt_key_padding_mask=pcpt_key_padding_mask,
@@ -272,7 +272,7 @@ class TransformerModel(nn.Module):
             gen_genes=gen_genes,
         )
 
-        return pcpt_output, gen_output, aux_loss
+        return pcpt_output, gen_output, aux_loss, gene_label_layer_distributions, cell_type_label_distribution
 
     def _get_cell_emb_from_layer(
         self, layer_output: Tensor, weights: Tensor = None
@@ -504,7 +504,7 @@ class TransformerModel(nn.Module):
                     embsize]
         """
 
-        pcpt_output, gen_output, aux_loss = self.transformer_generate(
+        pcpt_output, gen_output, aux_loss, gene_label_layer_distributions, cell_type_label_distribution = self.transformer_generate(
             pcpt_genes,
             pcpt_values,
             pcpt_key_padding_mask,
@@ -560,7 +560,7 @@ class TransformerModel(nn.Module):
             do_sample=do_sample,
         )
 
-        return output, aux_loss
+        return output, aux_loss, gene_label_layer_distributions, cell_type_label_distribution
 
     def perceptual_forward(
         self,
