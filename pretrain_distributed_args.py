@@ -388,7 +388,7 @@ def get_model(args: argparse.Namespace, vocab: GeneVocab) -> DDP:
         fast_transformer_backend="flash",
         num_experts=args.num_experts,
         k=args.k,
-        expert_specialization_params=get_expert_specialization_params(args, vocab)
+        # expert_specialization_params=get_expert_specialization_params(args, vocab)
     ).to(LOCAL_RANK)
     ddp_model = DDP(model, device_ids=[LOCAL_RANK])
     printgpu(f"Model initialized with {sum(p.numel() for p in model.parameters() if p.requires_grad):_} trainable parameters")
@@ -402,6 +402,7 @@ def get_expert_specialization_params(args: argparse.Namespace, vocab: GeneVocab)
             n_cell_types = len(vocab_cell_type)
         return {
             "n_experts": args.num_experts,
+            "k": args.k,
             "n_genes": len(vocab),
             "n_cell_types": n_cell_types,
         }
@@ -558,7 +559,6 @@ def pretrain(
             if args.cell_type_vocab_path is not None:
                 cell_type_ids = data_dict.get("cell_type_id", None)
                 cell_type_ids = cell_type_ids.to(device) if cell_type_ids is not None else None
-                print(f"cell_type_ids.shape: {cell_type_ids.shape}" if cell_type_ids is not None else "cell_type_ids is None")
             else:
                 cell_type_ids = None
             pcpt_key_padding_mask = pcpt_gene.eq(vocab[args.pad_token])
@@ -568,7 +568,7 @@ def pretrain(
                 [printmaster(f"data_dict key: {k}, shape: {v.shape}") for k, v in data_dict.items()]
             
             with torch.cuda.amp.autocast(enabled=args.fp16):
-                output_dict, aux_loss1, gene_label_layer_distributions, cell_type_label_distribution = model(
+                output_dict, aux_loss1, _, _ = model(
                     pcpt_gene,
                     pcpt_expr,
                     pcpt_key_padding_mask,
@@ -577,13 +577,9 @@ def pretrain(
                     CLS=USE_CLS,
                     MVC=MVC,
                     generative_training=True,
-                    cell_type_ids=cell_type_ids
                 )
                 if i == 0:
                     [printmaster(f"output_dict key: {k}, shape: {v.shape}") for k, v in output_dict.items()]
-                    print(f"aux_loss1: {aux_loss1.item() if aux_loss1 is not None else None}")
-                    print(f"gene_label_layer_distributions: {[distribution.shape for distribution in gene_label_layer_distributions]}" if gene_label_layer_distributions is not None else "gene_label_layer_distributions is None")
-                    print(f"cell_type_label_distribution: {cell_type_label_distribution.shape}" if cell_type_label_distribution is not None else "cell_type_label_distribution is None")
 
                 positions_to_match = ~gen_key_padding_mask
                 loss_mse = criterion(
@@ -601,7 +597,7 @@ def pretrain(
                 aux_loss2 = None
                 if global_iter > 1000:
                     previous_cell_embs = output_dict["cell_emb"].detach()
-                    preds_dict, aux_loss2, gene_label_layer_distributions, cell_type_label_distribution = model(
+                    preds_dict, aux_loss2, _, _ = model(
                         pcpt_gene,
                         pcpt_expr,
                         pcpt_key_padding_mask,
@@ -611,7 +607,6 @@ def pretrain(
                         MVC=False,
                         input_cell_emb=previous_cell_embs,
                         generative_training=True,
-                        cell_type_ids=cell_type_ids
                     )
                     loss_gen = criterion(preds_dict['gen_preds'], gen_expr_target, positions_to_match)
                 if aux_loss1 is not None:
@@ -656,7 +651,6 @@ def pretrain(
                 model.train()
             global_iter += 1
             dist.barrier()
-            break
 
         delta_training_time = log_training(args, scheduler, writer, training_start_time, delta_training_time, n_total_batches, global_iter, epoch, running_loss_mse, running_loss_mvc, running_loss_aux, running_loss_gen, running_loss_total, i, ((i+1) % args.log_interval))
         running_loss_mse, running_loss_mvc, running_loss_aux, running_loss_gen, running_loss_total = 0.0, 0.0, 0.0, 0.0, 0.0
@@ -698,7 +692,7 @@ def log_training(args, scheduler, writer, training_start_time, delta_training_ti
 
 
 def eval_and_save(args, model, train_loader, validation_loader, criterion, optimizer, scheduler, device, vocab, scaler, best_val_mse, writer, training_start_time, delta_training_time, global_iter, epoch, i):
-    val_mse, val_mre = evaluate(
+    val_mse, val_mre, gene_label_layer_distributions, cell_type_label_distribution = evaluate(
         model=model,
         validation_loader=validation_loader,
         device=device,
@@ -707,6 +701,7 @@ def eval_and_save(args, model, train_loader, validation_loader, criterion, optim
         fp16_enabled=args.fp16,
         mask_value=args.mask_value,
         criterion=criterion,
+        expert_specialization_params=get_expert_specialization_params(args, vocab)
     )
     if is_master_gpu():
         writer.add_scalar("validation/mse", val_mse, global_iter)
@@ -717,7 +712,7 @@ def eval_and_save(args, model, train_loader, validation_loader, criterion, optim
             if is_master_gpu():
                 torch.save(
                     model.state_dict(),
-                    SAVE_DIR / "best_model_mse.pt",
+                    SAVE_DIR / "best_model.pt",
                 )
                 saved = True
                 
@@ -753,7 +748,12 @@ def eval_and_save(args, model, train_loader, validation_loader, criterion, optim
             "scaler_state": scaler.state_dict(),
             "scheduler_state": scheduler.state_dict(),
         }
+        distribution_dict = {
+            "gene_label_distribution": gene_label_layer_distributions,
+            "cell_type_label_distribution": cell_type_label_distribution
+        }
         torch.save(state_dict, SAVE_DIR / f"checkpoint-{epoch+1}-{i+1}.pt")
+        torch.save(distribution_dict, SAVE_DIR / f"distributions-{epoch+1}-{i+1}.pt")
     return best_val_mse, delta_training_time
 
 
@@ -766,6 +766,7 @@ def evaluate(
         fp16_enabled: bool,
         mask_value: float,
         criterion: nn.Module,
+        expert_specialization_params: Dict[str, Union[bool, int]] = None
     ) -> Dict[str, torch.Tensor]:
     """
     Evaluate the model on the evaluation data.
@@ -801,7 +802,8 @@ def evaluate(
                     CLS=False,
                     MVC=False,
                     generative_training=True,
-                    cell_type_ids=cell_type_ids
+                    cell_type_ids=cell_type_ids,
+                    expert_specialization_params=expert_specialization_params
                 )
                 output_values = output_dict["gen_preds"]
 
@@ -826,10 +828,12 @@ def evaluate(
         dist.all_reduce(total_count, op=dist.ReduceOp.SUM)
         global_mse = total_mse.item() / total_count.item()
         global_mre = total_mre.item() / total_count.item()
+        dist.all_reduce(gene_label_layer_distributions, op=dist.ReduceOp.SUM) if gene_label_layer_distributions is not None else None
+        dist.all_reduce(cell_type_label_distribution, op=dist.ReduceOp.SUM) if cell_type_label_distribution is not None else None
     else:
         raise ValueError("Distributed not initialized")
     model.train()
-    return global_mse, global_mre
+    return global_mse, global_mre, gene_label_layer_distributions, cell_type_label_distribution
 
 
 # %% setup and initialization
