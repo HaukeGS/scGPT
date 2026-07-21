@@ -43,7 +43,7 @@ pip install scgpt "flash-attn<1.0.5"  # optional, recommended
 pip install wandb
 ```
 
-For developing, we are using the [Poetry](https://python-poetry.org/) package manager. To install Poetry, follow the instructions [here](https://python-poetry.org/docs/#installation).
+The poetry installation is out of sync. Please use pip install instead. ~~For developing, we are using the [Poetry](https://python-poetry.org/) package manager. To install Poetry, follow the instructions [here](https://python-poetry.org/docs/#installation).~~
 
 ```bash
 $ git clone this-repo-url
